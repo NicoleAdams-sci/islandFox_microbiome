@@ -1,0 +1,2825 @@
+---
+title: Adams et al. Effect of geography and captivity on scat bacterial communities
+  in the imperiled Channel Island Fox. Data processing and analyses
+author: "Adams et al."
+date: "March 25, 2021"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    code_folding: show
+    toc: yes 
+---
+
+# Code for data analyses
+
+## Load in R libraries
+```{r, warning=FALSE, message=FALSE}
+#source("https://bioconductor.org/biocLite.R")
+#biocLite("phyloseq")
+#biocLite("DESeq2")
+#biocLite("decontam")
+#devtools::install_github("jbisanz/qiime2R")
+#devtools::install_github("haozhu233/kableExtra")
+#devtools::install_gitbub("vmikk/metagMisc")
+#devtools::install_github("guokai8/microbial")
+#remotes::install_github("ying14/yingtools2")
+
+library(knitr) # R markdown
+library(kableExtra) # R markdown tables
+library(tidyverse) # data wrangling
+library(dplyr) # data wrangling
+library("reshape") # data wrangling
+library(qiime2R) # get count and taxa tables into R
+library(decontam) # filtering blanks
+library(metagMisc) 
+library("phyloseq") # microbiome analyses
+library("DESeq2") # vst, betadisper
+library("vegan") # adonis, anosim
+library(pairwiseAdonis) # pairwise adonis
+library("ggplot2") # beautiful plots
+library("dendextend") # hclust plotting
+library("viridis") # color palette
+library(gridExtra) # plotting
+library(ggsignif) # plotting
+library(ggpubr) # plotting
+library(cowplot) #plotting
+library(FSA) # dunn post hoc test
+library(RColorBrewer)  # plotting
+library(ggpmisc) #plotting regression eq
+library(cluster) # gap statistics
+library(ggdendro) # plotting dendrograms
+library(ggrepel) # labeling points
+
+```
+
+&nbsp;
+
+## Load in data
+Import metadata, count and taxonomy Qiime tables and tidy up data. 
+
+&nbsp;
+
+*Samples from a different sequencing run (batch 2) are removed due to a significant batch effect likely attributed to extractions done by different researchers years apart and sequencing at different facilities. Batch 2  was a smaller dataset and did not have any samples from the islands, which is our primary interest. The gray fox sample is removed from the data because it is the only gray fox sample in the sequencing run and because it was collected 5 years before the island fox samples were collected. These samples are therefore removed from the dataset at this step and not used in the analyses of this study.* 
+```{r, warning=FALSE, message=FALSE}
+metadata.decont <- read.table("/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/Data.Analyses/Seq1y2_Qiime_10-16-18/sample_metadata_UPdated_6-29-2021.txt", header=TRUE) 
+
+ASVs<-qza_to_phyloseq(metadata="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/Data.Analyses/Seq1y2_Qiime_10-16-18/sample_metadata_UPdated_6-29-2021.txt", features="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/Data.Analyses/Seq1y2_Qiime_10-16-18/table-no-mca.qza", tree="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/Data.Analyses/Seq1y2_Qiime_10-16-18/rooted-tree.qza", taxonomy="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/Data.Analyses/Seq1y2_Qiime_10-16-18/taxonomy.qza", tmp="C:/tmp")
+
+colnames(tax_table(ASVs)) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+# Order islands
+sample_data(ASVs)$source <-factor(sample_data(ASVs)$source, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI", "SBZ", "OCZ", "CALM", "GRAY", "MOCKCOM", "BLANK", "NEGATIVE"))
+
+# separate phyloseq obj into sequencing batches and remove mock community
+ASVs.batch1 <- subset_samples(ASVs, batch == "one")
+ASVs.batch1 <- subset_samples(ASVs.batch1, source != "MOCKCOM")
+ASVs.batch2 <- subset_samples(ASVs, batch == "two")
+ASVs.batch2 <- subset_samples(ASVs.batch2, source != "MOCKCOM")
+
+metadata.decont <- subset(metadata.decont, source != "MOCKCOM")
+
+# Add species names
+sample_data(ASVs.batch1)$species <- as.factor(ifelse(ASVs.batch1@sam_data$source == "GRAY", "cin", "lit"))
+metadata.decont$species <- as.factor(ifelse(metadata.decont$source == "GRAY", "cin", "lit"))
+
+# Remove gray fox
+ASVs.batch1.ng <- subset_samples(ASVs.batch1, source != "GRAY")
+metadata.decont <- subset(metadata.decont, subset= source != "GRAY")
+metadata.decont$source <- droplevels(metadata.decont$source)
+metadata.decont$species <- droplevels(metadata.decont$species)
+
+# Remove seq batch 2 from metadata
+metadata.decont <- subset(metadata.decont, subset= batch == "one")
+metadata.decont$batch <- droplevels(metadata.decont$batch)
+
+```
+
+&nbsp;
+
+### Remove possible contaminants
+Remove possible contaminants based on frequency following the Decontam tutorial, [link](https://benjjneb.github.io/decontam/vignettes/decontam_intro.html).
+```{r, warning=FALSE, message=FALSE}
+# Decontam based on frequency: 
+
+# Define negatives for prevalence
+decontam <- function(asv) {
+  sample_data(asv)$is.neg <- sample_data(asv)$Sample_or_Control == "Control"
+  contamdf.comb <- isContaminant(asv, method="combined", conc="quant_reading", neg="is.neg")
+  contam.tab <- table(contamdf.comb$contaminant)
+  head(which(contamdf.comb$contaminant))
+  
+  my_contaminants <- which(contamdf.comb$contaminant)
+  contamdf.comb[my_contaminants,]
+  contam.num <- length(contamdf.comb[my_contaminants,]$freq)
+  
+  asv.noncontam <<- prune_taxa(!contamdf.comb$contaminant, asv) # <<- assigns a global variable
+  
+  return(asv.noncontam) # return(list(contam.tab, contam.num, asv.noncontam))
+}
+
+ASVs.batch1.noncontam <- decontam(asv = ASVs.batch1.ng) # 12 contaminants; 8042 taxa and 94 samples
+
+batch1.post.reads <- sum(colSums(otu_table(ASVs.batch1.noncontam))) # 9283245 reads
+
+batch1.pre.reads <- sum(colSums(otu_table(ASVs.batch1))) # 9421247 reads
+
+```
+
+```{r, warning=FALSE, message=FALSE, results='asis'}
+batch1.pre <- dim(otu_table(ASVs.batch1.ng))
+batch1.post <- dim(otu_table(ASVs.batch1.noncontam))
+
+pre.post <- as.data.frame(rbind(batch1.pre, batch1.post))
+names(pre.post)[names(pre.post) == "V1"] <- "nTaxa"
+names(pre.post)[names(pre.post) == "V2"] <- "Samples"
+pre.post$nReads <- c(batch1.pre.reads,batch1.post.reads)
+
+
+kable(pre.post, caption = "Number of taxa, samples, and reads before and after removing contaminants") %>% kable_styling()
+```
+
+&nbsp;
+&nbsp;
+
+### Filter out sequencing blanks
+Remove samples after evaluating ASV counts. Prune samples with counts lower than 1000 from the phyloseq object and metadata.
+```{r, warning=FALSE, message=FALSE}
+# Plot histogram of AVS counts by source
+batch1.blanks.pre <- qplot(colSums(otu_table(ASVs.batch1.noncontam)),bins=30, fill=ASVs.batch1.noncontam@sam_data$source, xlab = "colSum", main = "Batch1.blanks.pre") + labs(fill = "source")
+
+# Pruning those with counts lower than 1000
+ASVs.batch1.noncontam.nolow <- prune_samples(sample_sums(ASVs.batch1.noncontam)>=1000, ASVs.batch1.noncontam)
+
+# Plot histogram of AVS counts by source after post-removing blanks
+batch1.blanks.post <-qplot(colSums(otu_table(ASVs.batch1.noncontam.nolow)),bins=30, fill=ASVs.batch1.noncontam.nolow@sam_data$source, xlab = "colSum", main = "Batch1.blanks.post") + labs(fill = "source")
+
+# Remove samples from metadata
+rmv <- c("BLANK.10", "BLANK.11", "BLANK.2", "BLANK.7", "BLANK.9")
+metadata.decont2 <- metadata.decont[ ! metadata.decont$id %in% rmv, ]
+metadata.decont2$id <- factor(metadata.decont2$id)
+
+# Rename phyloseq object 
+ASVs.B1 <- ASVs.batch1.noncontam.nolow
+
+#cowplot::plot_grid(batch1.blanks.pre, batch1.blanks.post, ncol = 2, nrow = 1)
+```
+
+&nbsp;
+
+```{r, warning=FALSE, message=FALSE, results='asis'}
+batch1.nolow.reads <- sum(colSums(otu_table(ASVs.batch1.noncontam.nolow)))
+batch1.nolow <- dim(otu_table(ASVs.batch1.noncontam.nolow))
+batch1.nolow <- append(batch1.nolow, batch1.nolow.reads, after = length(batch1.nolow))
+
+pre.post2 <- rbind(pre.post, batch1.nolow)
+rownames(pre.post2)[3] <- "batch1.nolow"
+
+
+kable(pre.post2, caption = "Number of taxa, samples, and reads before and after removing contaminants and blanks") %>% kable_styling()
+```
+
+&nbsp;
+&nbsp;
+
+### Examine Technical replicates
+```{r, warning=FALSE, message=FALSE}
+# Make phyloseq object and metadata for just technical replicates
+ASVs.B1_techRep <- subset_samples(ASVs.B1, replicate == "yes")
+source2rm <- c("SBZ", "OCZ")
+ASVs.B1_techRep <- subset_samples(ASVs.B1_techRep, !source %in% source2rm)
+metadata.decont_techRep <- subset(metadata.decont2, subset= replicate == "yes")
+metadata.decont_techRep <- subset(metadata.decont_techRep, !(source %in% source2rm))
+
+# Convert replicate phyloseq object to DESeq2 object then transform data
+asv_deseq_techRep <- phyloseq_to_deseq2(ASVs.B1_techRep, ~ source)
+asv_deseq2_techRep <- estimateSizeFactors(asv_deseq_techRep, type="poscounts") #poscounts fixes the issues with zero counts
+asv_vst_techRep <- varianceStabilizingTransformation(asv_deseq2_techRep)
+
+vst_count_tab_techRep <- assay(asv_vst_techRep)
+vst_count_tab_techRep[vst_count_tab_techRep < 0] <- 0 # make all negative values zero in order to use 'bray' distance in ordination see https://github.com/joey711/phyloseq/issues/299
+
+# Put transformed data back into a Phyloseq object
+vst_count_phy_techRep <- otu_table(vst_count_tab_techRep, taxa_are_rows=T)
+sample_data(ASVs.B1)$id <- row.names(sample_data(ASVs.B1))
+sample_info_phy_techRep <- sample_data(ASVs.B1)
+vst_physeq_techRep <- phyloseq(vst_count_phy_techRep, sample_info_phy_techRep)
+
+# Principal coordinate analysis of technical replicates based on Bray-Curtis distance
+#vst_pcoa_techRep <- ordinate(vst_physeq_techRep, method="MDS", distance="euclidean")
+vst_pcoa_techRep <- ordinate(vst_physeq_techRep, method="MDS", distance="bray")
+eigen_vals_techRep <- vst_pcoa_techRep$values$Eigenvalues 
+
+colourCount = length(unique(sample_data(vst_physeq_techRep)$id))
+getPalette = colorRampPalette(brewer.pal(8, "Paired"))
+
+tech.pca.plot <- plot_ordination(vst_physeq_techRep, vst_pcoa_techRep, color="id", shape="source") + 
+  labs(col="id", shape="source") + geom_point(size=8) + 
+    coord_fixed(sqrt(eigen_vals_techRep[2]/eigen_vals_techRep[1])) + #ggtitle("PCoA of technical replicates, Bray-Curtis") + 
+  scale_color_manual(values = getPalette(colourCount)) +
+  theme_bw() + theme(text = element_text(size=15)) + guides(color=guide_legend(ncol = 2))
+
+tech.pca.plot
+
+# jpeg(filename="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/ms_drafts/FrontiersInMicro_6-26-2021/FigS1_techReps.jpg", units="in", width=11, height=8, res=300)
+# tech.pca.plot
+# dev.off()
+```
+
+&nbsp;
+
+### Merge Technical Replicates
+Merge technical replicates based on average counts then repair factors and remove duplicates from metadata. 
+```{r, warning=FALSE, message=FALSE}
+# Function to merge samples
+merge_samples_mean <- function(physeq, group){
+  group_sums <- as.matrix(table(sample_data(physeq)[ ,group]))[,1]
+  merged <- merge_samples(physeq, group)
+  x <- as.matrix(otu_table(merged))
+if(taxa_are_rows(merged)){ x<-t(x) }
+out <- t(x/group_sums)
+out <- floor(out)
+out <- otu_table(out, taxa_are_rows = TRUE)
+otu_table(merged) <- out
+return(merged)
+}
+
+ASVs.B1.noRep <- merge_samples_mean(ASVs.B1, "id_merge")
+
+OTUnames10 = names(sort(taxa_sums(ASVs.B1), TRUE)[1:10])
+GP10  = prune_taxa(OTUnames10,  ASVs.B1)
+mGP10 = prune_taxa(OTUnames10, ASVs.B1.noRep)
+ocean_samples = sample_names(subset(sample_data(ASVs.B1), id_merge=="CAT.E2211"))
+
+sample_data(ASVs.B1.noRep)$id_merge = sample_names(ASVs.B1.noRep)
+
+# Sanity check to make sure they are identical
+check <- identical(ASVs.B1.noRep@sam_data$id_merge, rownames(ASVs.B1.noRep@sam_data))
+
+# repair factors within the phyloseq object
+ASVs.B1.noRep@sam_data$year_collected <- as.factor(ASVs.B1.noRep@sam_data$year_collected)
+sample_data(ASVs.B1.noRep)$source <- levels(sample_data(ASVs.B1)$source)[get_variable(ASVs.B1.noRep, "source")]
+sample_data(ASVs.B1.noRep)$sex <- levels(sample_data(ASVs.B1)$sex)[get_variable(ASVs.B1.noRep, "sex")]
+sample_data(ASVs.B1.noRep)$date_collected <- levels(sample_data(ASVs.B1)$date_collected)[get_variable(ASVs.B1.noRep, "date_collected")]
+sample_data(ASVs.B1.noRep)$season_collected <- levels(sample_data(ASVs.B1)$season_collected)[get_variable(ASVs.B1.noRep, "season_collected")]
+sample_data(ASVs.B1.noRep)$month_collected <- levels(sample_data(ASVs.B1)$month_collected)[get_variable(ASVs.B1.noRep, "month_collected")]
+sample_data(ASVs.B1.noRep)$batch <- levels(sample_data(ASVs.B1)$batch)[get_variable(ASVs.B1.noRep, "batch")]
+sample_data(ASVs.B1.noRep)$Sample_or_Control <- levels(sample_data(ASVs.B1)$Sample_or_Control)[get_variable(ASVs.B1.noRep, "Sample_or_Control")]
+sample_data(ASVs.B1.noRep)$region <- levels(sample_data(ASVs.B1)$region)[get_variable(ASVs.B1.noRep, "region")]
+sample_data(ASVs.B1.noRep)$wild_captive <- levels(sample_data(ASVs.B1)$wild_captive)[get_variable(ASVs.B1.noRep, "wild_captive")]
+sample_data(ASVs.B1.noRep)$replicate <- levels(sample_data(ASVs.B1)$replicate)[get_variable(ASVs.B1.noRep, "replicate")]
+
+
+# Remove replicates from metadata files 
+rmv <- c("CAT.E2211.2", "CAT.F0534.2", "SCL.10.2", "SCL.17.2", "SCL.19.2", "SMI.15.2", "SMI.9.2", "SNI.20.2", "SRI.19.2", "SRI.20.2")
+metadata.decont.deRep <- metadata.decont2[ ! metadata.decont2$id %in% rmv, ]
+metadata.decont.deRep$id <- factor(metadata.decont.deRep$id)
+
+```
+
+&nbsp;
+
+```{r, warning=FALSE, message=FALSE, results='asis'}
+batch1.final <- dim(otu_table(ASVs.B1.noRep))
+batch1.final.reads <- sum(colSums(otu_table(ASVs.B1.noRep)))
+batch1.final4table <- append(batch1.final, batch1.final.reads, after = length(batch1.final))
+
+pre.post3 <- rbind(pre.post2, batch1.final4table)
+rownames(pre.post3)[4] <- "batch1.final"
+
+
+
+kable(pre.post3, caption = "Number of taxa, samples, and reads used in analyses") %>% kable_styling()
+```
+
+&nbsp;
+&nbsp;
+
+&nbsp;
+&nbsp;
+
+## Beta diversity analyses
+
+### Transform de-replicated data
+Transfrom remaining data with DESeq2 with variance stabilizing transformation.
+```{r, warning=FALSE, message=FALSE}
+# Transform data
+asv_deseq <- phyloseq_to_deseq2(ASVs.B1.noRep, ~ source)
+asv_deseq2 <- estimateSizeFactors(asv_deseq, type="poscounts") #poscounts fixes the issues with zero counts
+asv_vst <- varianceStabilizingTransformation(asv_deseq2)
+vst_trans_count_tab <- assay(asv_vst)
+vst_trans_count_tab[vst_trans_count_tab < 0] <- 0 # make all negative values zero in order to use 'bray' distance in ordination see https://github.com/joey711/phyloseq/issues/299
+
+```
+
+&nbsp;
+
+#### Clean up captive samples' names and define colors for source
+```{r, warning=FALSE, message=FALSE}
+# Change names of zoo samples in phyloseq obj and asv count table
+sample_data(ASVs.B1.noRep)$id_merge[sample_data(ASVs.B1.noRep)$id_merge == "OCZOO.1"] <- "OCZ.1a"
+sample_data(ASVs.B1.noRep)$id_merge[sample_data(ASVs.B1.noRep)$id_merge == "OCZ.2"] <- "OCZ.1b"
+sample_data(ASVs.B1.noRep)$id_merge[sample_data(ASVs.B1.noRep)$id_merge == "SBZOO.1"] <- "SBZ.1"
+sample_data(ASVs.B1.noRep)$id_merge[sample_data(ASVs.B1.noRep)$id_merge == "SBZ.3"] <- "SBZ.2a"
+sample_data(ASVs.B1.noRep)$id_merge[sample_data(ASVs.B1.noRep)$id_merge == "SBZ.4"] <- "SBZ.2b"
+
+sample_names(ASVs.B1.noRep)[sample_names(ASVs.B1.noRep) == "OCZOO.1"] <- "OCZ.1a"
+sample_names(ASVs.B1.noRep)[sample_names(ASVs.B1.noRep) == "OCZ.2"] <- "OCZ.1b"
+sample_names(ASVs.B1.noRep)[sample_names(ASVs.B1.noRep) == "SBZOO.1"] <- "SBZ.1"
+sample_names(ASVs.B1.noRep)[sample_names(ASVs.B1.noRep) == "SBZ.3"] <- "SBZ.2a"
+sample_names(ASVs.B1.noRep)[sample_names(ASVs.B1.noRep) == "SBZ.4"] <- "SBZ.2b"
+
+colnames(vst_trans_count_tab)[colnames(vst_trans_count_tab) == "OCZOO.1"] <- "OCZ.1a"
+colnames(vst_trans_count_tab)[colnames(vst_trans_count_tab) == "OCZ.2"] <- "OCZ.1b"
+colnames(vst_trans_count_tab)[colnames(vst_trans_count_tab) == "SBZOO.1"] <- "SBZ.1"
+colnames(vst_trans_count_tab)[colnames(vst_trans_count_tab) == "SBZ.3"] <- "SBZ.2a"
+colnames(vst_trans_count_tab)[colnames(vst_trans_count_tab) == "SBZ.4"] <- "SBZ.2b"
+
+# Define colors for source
+sample_data(ASVs.B1.noRep)$source_color[sample_data(ASVs.B1.noRep)$source == "SMI"] <- "midnightblue"
+sample_data(ASVs.B1.noRep)$source_color[sample_data(ASVs.B1.noRep)$source == "SRI"] <- "royalblue2"
+sample_data(ASVs.B1.noRep)$source_color[sample_data(ASVs.B1.noRep)$source == "SCZ"] <- "cadetblue2"
+sample_data(ASVs.B1.noRep)$source_color[sample_data(ASVs.B1.noRep)$source == "CAT"] <- "darkred"
+sample_data(ASVs.B1.noRep)$source_color[sample_data(ASVs.B1.noRep)$source == "SCL"] <- "firebrick1"
+sample_data(ASVs.B1.noRep)$source_color[sample_data(ASVs.B1.noRep)$source == "SNI"] <- "coral2"
+#sample_data(ASVs.B1.noRep)$source_color[sample_data(ASVs.B1.noRep)$source == "GRAY"] <- "gray42"
+sample_data(ASVs.B1.noRep)$source_color[sample_data(ASVs.B1.noRep)$source == "OCZ"] <- "green2"
+sample_data(ASVs.B1.noRep)$source_color[sample_data(ASVs.B1.noRep)$source == "SBZ"] <- "darkgreen"
+
+```
+
+&nbsp;
+&nbsp;
+
+### Create a dendrogram
+see https://rstudio-pubs-static.s3.amazonaws.com/68544_06343669257d4f35aaca449f9ff1e6f7.html
+```{r, warning=FALSE, message=FALSE}
+# Define shape for region: northern and southern islands, and captive samples
+sample_data(ASVs.B1.noRep)$region_shape[sample_data(ASVs.B1.noRep)$source == "SMI"] <- 16
+sample_data(ASVs.B1.noRep)$region_shape[sample_data(ASVs.B1.noRep)$source == "SRI"] <- 16
+sample_data(ASVs.B1.noRep)$region_shape[sample_data(ASVs.B1.noRep)$source == "SCZ"] <- 16
+sample_data(ASVs.B1.noRep)$region_shape[sample_data(ASVs.B1.noRep)$source == "CAT"] <- 17
+sample_data(ASVs.B1.noRep)$region_shape[sample_data(ASVs.B1.noRep)$source == "SCL"] <- 17
+sample_data(ASVs.B1.noRep)$region_shape[sample_data(ASVs.B1.noRep)$source == "SNI"] <- 17
+sample_data(ASVs.B1.noRep)$region_shape[sample_data(ASVs.B1.noRep)$source == "OCZ"] <- 15
+sample_data(ASVs.B1.noRep)$region_shape[sample_data(ASVs.B1.noRep)$source == "SBZ"] <- 15
+
+
+# Calculate Bray-Curtis distance matrix
+#euc_dist <- dist(t(vst_trans_count_tab))
+br_dist <- vegdist(t(vst_trans_count_tab), method = "bray")
+
+# make and plot a hierarchical clustering of samples
+br_clust <- hclust(br_dist, method="ward.D2")
+
+br_dend <- as.dendrogram(br_clust, hang=0.1)
+dend_cols <- sample_data(ASVs.B1.noRep)$source_color[order.dendrogram(br_dend)]
+labels_colors(br_dend) <- dend_cols
+dend_shape <- sample_data(ASVs.B1.noRep)$region_shape[order.dendrogram(br_dend)]
+br_dend2 <- br_dend %>% set("leaves_pch", c(as.numeric(dend_shape))) %>% set("leaves_col", dend_cols)
+
+plot(br_dend2, ylab="Transformed Bray-Curtis")
+
+#jpeg(filename="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/ms_drafts/FrontiersInMicro_6-26-2021/Fig3_dendro.jpg", units="in", width=11, height=8, res=300)
+#plot(euc_dend2, ylab="Transformed Euclidean distance")
+#dev.off()
+
+# gd <- as.ggdend(br_dend2)
+# ggplot(gd) + labs(y="Transformed Bray-Curtis")
+
+```
+
+&nbsp;
+
+#### add label to dend figure
+```{r, warning=FALSE, message=FALSE}
+# function from https://logfc.wordpress.com/2017/03/15/adding-figure-labels-a-b-c-in-the-top-left-corner-of-the-plotting-region/  Posted on March 15, 2017
+fig_label <- function(text, region="figure", pos="topleft", cex=NULL, ...) {
+  region <- match.arg(region, c("figure", "plot", "device"))
+  pos <- match.arg(pos, c("topleft", "top", "topright", 
+                          "left", "center", "right", 
+                          "bottomleft", "bottom", "bottomright"))
+  if(region %in% c("figure", "device")) {
+    ds <- dev.size("in")
+    # xy coordinates of device corners in user coordinates
+    x <- grconvertX(c(0, ds[1]), from="in", to="user")
+    y <- grconvertY(c(0, ds[2]), from="in", to="user")
+    # fragment of the device we use to plot
+    if(region == "figure") {
+      # account for the fragment of the device that 
+      # the figure is using
+      fig <- par("fig")
+      dx <- (x[2] - x[1])
+      dy <- (y[2] - y[1])
+      x <- x[1] + dx * fig[1:2]
+      y <- y[1] + dy * fig[3:4]
+    } 
+  }
+  # much simpler if in plotting region
+  if(region == "plot") {
+    u <- par("usr")
+    x <- u[1:2]
+    y <- u[3:4]
+  }
+  sw <- strwidth(text, cex=cex) * 60/100
+  sh <- strheight(text, cex=cex) * 60/100
+  x1 <- switch(pos,
+    topleft     =x[1] + sw, 
+    left        =x[1] + sw,
+    bottomleft  =x[1] + sw,
+    top         =(x[1] + x[2])/2,
+    center      =(x[1] + x[2])/2,
+    bottom      =(x[1] + x[2])/2,
+    topright    =x[2] - sw,
+    right       =x[2] - sw,
+    bottomright =x[2] - sw)
+  y1 <- switch(pos,
+    topleft     =y[2] - sh,
+    top         =y[2] - sh,
+    topright    =y[2] - sh,
+    left        =(y[1] + y[2])/2,
+    center      =(y[1] + y[2])/2,
+    right       =(y[1] + y[2])/2,
+    bottomleft  =y[1] + sh,
+    bottom      =y[1] + sh,
+    bottomright =y[1] + sh)
+  old.par <- par(xpd=NA)
+  on.exit(par(old.par))
+  text(x1, y1, text, cex=cex, ...)
+  return(invisible(c(x,y)))
+}
+ 
+# jpeg(filename="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/ms_drafts/FrontiersInMicro_6-26-2021/Fig3A_dendro.jpg", units="in", width=11, height=8, res=300)
+# plot(br_dend2, ylab="Transformed Bray-Curtis")
+# fig_label("A", cex=2)
+# dev.off()
+
+```
+
+
+&nbsp;
+&nbsp;
+
+### Principal coordinate analysis on all samples
+```{r, warning=FALSE, message=FALSE}
+# Make phyloseq object with transformed table
+vst_count_phy <- otu_table(vst_trans_count_tab, taxa_are_rows=T)
+sample_info_phy <- sample_data(ASVs.B1.noRep)
+vst_physeq <- phyloseq(vst_count_phy, sample_info_phy)
+
+# Define source colors and factor levels
+cols <- c("SMI" = "midnightblue", "SRI" = "royalblue2", "SCZ" = "cadetblue2", "CAT" = "darkred", "SCL" = "firebrick1", "SNI" = "coral2", "SBZ" = "darkgreen", "OCZ" = "green2")
+
+vst_physeq@sam_data$source <- factor(vst_physeq@sam_data$source, levels = c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI", "SBZ", "OCZ"))
+vst_physeq@sam_data$region <- factor(vst_physeq@sam_data$region, levels = c("north", "south", "mainland"))
+
+
+# Principal coordinate analysis
+#vst_pcoa_euc <- ordinate(vst_physeq, method="MDS", distance="euclidean")
+vst_pcoa_euc <- ordinate(vst_physeq, method="MDS", distance="bray")
+euc_eigen_vals <- vst_pcoa_euc$values$Eigenvalues
+
+# Plot PCoA 
+all.pca <- plot_ordination(vst_physeq, vst_pcoa_euc, color="source", shape = "region") + 
+  labs(col="source", shape="region") + geom_point(size=5, alpha=0.99) + 
+    coord_fixed(sqrt(euc_eigen_vals[2]/euc_eigen_vals[1])) + #ggtitle("PCoA, Euc dist") + 
+  scale_color_manual(values = cols)  + #stat_ellipse() +
+  scale_shape_manual(labels = (c("north", "south", "captive")), values=c(16, 17, 15))+
+  theme_bw() + theme(text = element_text(size=15)) 
+
+all.pca
+```
+
+&nbsp;
+
+#### Distance to centroid (dispersion)
+Plot the dispersion of the source term
+```{r,  warning=FALSE, message=FALSE}
+# plot with ggplot2
+#dis.x <- dist(t(vst_trans_count_tab))
+dis.x <- vegdist(t(vst_trans_count_tab), method = "bray")
+cent <- betadisper(dis.x, ASVs.B1.noRep@sam_data$source)
+cent2 <- as.data.frame(cent$distances)
+cent2$id <- rownames(cent2)
+names(cent2)[names(cent2) == "cent$distances"] <- "distance"
+cent.source <- as.data.frame(cent$group)
+cent2$source <- cent.source$`cent$group`
+cent2$source <- factor(cent2$source, levels = c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI", "SBZ", "OCZ"))
+
+dist.box <- ggplot(cent2, aes( source, distance)) +
+  geom_boxplot(aes(color=factor(source), alpha = 0.5), show.legend = FALSE, outlier.shape = NA) + 
+  geom_jitter(aes(color=factor(source)), size=2, width=0.15, height=0, show.legend = FALSE) +
+  scale_color_manual(values=cols) +
+  #scale_color_viridis(discrete = T, end = 0.9, direction = -1) +
+  labs(x="Source", y="Bray-Curtis\n Distance to centroid") +
+  theme_bw() + theme(text = element_text(size=13)) 
+  #stat_compare_means(aes(group=source))
+
+
+# Fig. 4 combine PCoA and dispersion plot
+second.row <- cowplot::plot_grid(dist.box, labels = "C",ncol = 2)
+pcoaYbox <- cowplot::plot_grid(all.pca + theme(legend.position = "bottom", legend.box = "vertical"), dist.box, labels = c("B", "C"), nrow=1)
+#pcoaYbox
+
+# jpeg(filename="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/ms_drafts/FrontiersInMicro_6-26-2021/Fig3bc_pcoaYbox.jpg",   units="in", width=9, height=8, res=300) # 
+# pcoaYbox
+# dev.off()
+
+
+dist.box
+```
+
+&nbsp;
+&nbsp;
+
+
+### Multivariate analyses, all island samples
+#### Data wrangling
+First remove samples with missing data bc they can't go through betadisper. Then re-do the data transformation on new complete dataset. 
+```{r, warning=FALSE, message=FALSE}
+ASVs.B1.noRep.noNA <- subset_samples(ASVs.B1.noRep, region != "mainland" & id_merge != "SMI.11" & id_merge != "SMI.16" & id_merge != "SMI.5" & id_merge != "SMI.6" & id_merge != "SMI.7" & id_merge != "SMI.8" & id_merge != "SMI.9" & id_merge != "SCL.20.2" & id_merge != "SNI.10A" & id_merge != "SNI.17" & id_merge != "SNI.20" & id_merge != "SNI.2B") # N=62
+
+noNA_deseq <- phyloseq_to_deseq2(ASVs.B1.noRep.noNA, ~ source)
+noNA_deseq2 <- estimateSizeFactors(noNA_deseq, type="poscounts") #poscounts fixes the issues with zero counts
+noNA_vst <- varianceStabilizingTransformation(noNA_deseq2)
+noNA_trans_count_tab <- assay(noNA_vst)
+noNA_trans_count_tab[noNA_trans_count_tab < 0] <- 0
+isl_dist.noNA <- t(noNA_trans_count_tab)
+#isl_dist.noNA <- vegdist(isl_dist.noNA, method="euclidean", diag = TRUE)
+isl_dist.noNA <- vegdist(isl_dist.noNA, method="bray", diag = TRUE)
+
+# PCOAs
+isl_count_phy <- otu_table(noNA_trans_count_tab, taxa_are_rows=T)
+isl_sample_info_phy <- sample_data(ASVs.B1.noRep.noNA)
+isl_physeq <- phyloseq(isl_count_phy, isl_sample_info_phy)
+#isl_pcoa_euc <- ordinate(isl_physeq, method="MDS", distance="euclidean")
+isl_pcoa_euc <- ordinate(isl_physeq, method="MDS", distance="bray")
+isl_eigen_vals <- isl_pcoa_euc$values$Eigenvalues
+
+# remove any sample with missing data from phyloseq obj and metadata (rm all zoo and grays)
+metadata.decont.deRep.noNA <- metadata.decont.deRep[complete.cases(metadata.decont.deRep),] # N=62
+
+```
+
+&nbsp;
+
+#### Test for homogeneity of variances
+Use betadisper from Vegan to evaluate the homogeneity of variances.
+```{r, warning=FALSE, message=FALSE}
+# Define function
+geneity <- function(var1, nam){
+  homogA <- anova(betadisper(isl_dist.noNA, var1))
+  homogB <- as.data.frame(cbind(homogA$Df, round(homogA$`Sum Sq`), round(homogA$`Mean Sq`, digits = 2), signif(homogA$`F value`, digits = 2), signif(homogA$`Pr(>F)`, digits = 3)))
+  homog <- homogB[1,] # remove residuals
+  colnames(homog) <- c('Df','sumSq', 'meanSq', 'F', 'P')
+  rownames(homog) <- paste(nam)
+  return(homog)
+}
+
+gen1 <- geneity(metadata.decont.deRep.noNA$source, "island")
+gen2 <- geneity(metadata.decont.deRep.noNA$sex, "sex")
+gen3 <- geneity(metadata.decont.deRep.noNA$condition, "condition")
+gen4 <- geneity(metadata.decont.deRep.noNA$age, "age")
+gen5 <- geneity(metadata.decont.deRep.noNA$year_collected, "yearCollected")
+gen6 <- geneity(metadata.decont.deRep.noNA$month_collected, "monthCollected")
+gen7 <- geneity(metadata.decont.deRep.noNA$weight, "weight")
+gen8 <- geneity(metadata.decont.deRep.noNA$extracted.group, "extractGrp")
+
+gen.all <- as.data.frame(rbind(gen1, gen2, gen3, gen4, gen5, gen6, gen7, gen8))
+
+kable(gen.all, caption = "Test for homogeneity (betadisper) per variable")  %>% kable_styling() %>%
+   column_spec(6, bold=gen.all$P > 0.05)
+
+```
+
+&nbsp;
+
+#### Model testing with AICc
+I used a function to calculate AIC from the adonis model retrieved from [here](https://github.com/kdyson/R_Scripts/blob/master/AICc_PERMANOVA.R). I use it for models on samples w/ complete data. I start with sex as it is the only one that passed the homogeneity test. Then I added all the variables (regardless of homogeneity) into the model and sequentially removed variables with low variance explained (R2).  I evaluated the models with AIC.
+```{r, warning=FALSE, message=FALSE, results='asis'}
+ 
+AICc.PERMANOVA <- function(adonis.model) {
+    
+    # check to see if object is an adonis model...
+    
+    if (!(adonis.model$aov.tab[1,1] >= 1))
+        stop("object not output of adonis {vegan} ")
+    
+    # Ok, now extract appropriate terms from the adonis model
+    # Calculating AICc using residual sum of squares (RSS) since I don't think that adonis returns something I can use as a liklihood function...
+    
+    RSS <- adonis.model$aov.tab[rownames(adonis.model$aov.tab) == "Residuals", "SumsOfSqs"]
+    MSE <- adonis.model$aov.tab[rownames(adonis.model$aov.tab) == "Residuals", "MeanSqs"]
+    
+    k <- ncol(adonis.model$model.matrix)# + 1 # add one for error variance
+    
+    nn <- nrow(adonis.model$model.matrix)
+    
+    # AIC : 2*k + n*ln(RSS)
+    # AICc: AIC + [2k(k+1)]/(n-k-1)
+
+    # based on https://en.wikipedia.org/wiki/Akaike_information_criterion;
+    # https://www.researchgate.net/post/What_is_the_AIC_formula;
+    # http://avesbiodiv.mncn.csic.es/estadistica/ejemploaic.pdf
+    
+    # AIC.g is generalized version of AIC = 2k + n [Ln( 2(pi) RSS/n ) + 1]
+    # AIC.pi = k + n [Ln( 2(pi) RSS/(n-k) ) +1],
+    
+    AIC <- 2*k + nn*log(RSS)
+    AIC.g <- 2*k + nn * (1 + log( 2 * pi * RSS / nn))
+    AIC.MSE <- 2*k + nn * log(MSE)
+    AIC.pi <- k + nn*(1 + log( 2*pi*RSS/(nn-k) )   )
+    AICc <- AIC + (2*k*(k + 1))/(nn - k - 1)
+    AICc.MSE <- AIC.MSE + (2*k*(k + 1))/(nn - k - 1)
+    AICc.pi <- AIC.pi + (2*k*(k + 1))/(nn - k - 1)
+    
+    output <- list("AIC" = AIC, "AIC.g" = AIC.g, "AICc" = AICc,
+                   "AIC.MSE" = AIC.MSE, "AICc.MSE" = AICc.MSE,
+                   "AIC.pi" = AIC.pi, "AICc.pi" = AICc.pi, "k" = k)
+    
+    return(output)   
+
+}
+
+
+# Test variables that passed the test for homogeneity
+mod0a <- adonis(isl_dist.noNA ~ sex, data=metadata.decont.deRep.noNA, permutations = 99999)
+
+
+# Model testing by sequentially removed variables with low variance explained (R2)
+mod1a <- adonis(isl_dist.noNA ~ source + sex + condition + age + year_collected + month_collected + weight + extracted.group, data=metadata.decont.deRep.noNA, permutations = 99999)
+
+mod2a <- adonis(isl_dist.noNA ~ source + sex + condition + age + year_collected + month_collected + weight, data=metadata.decont.deRep.noNA, permutations = 99999)
+
+mod3a <- adonis(isl_dist.noNA ~ source + sex + age + year_collected + month_collected + weight, data=metadata.decont.deRep.noNA, permutations = 99999)
+
+mod4a <- adonis(isl_dist.noNA ~ source + sex + year_collected + month_collected + weight, data=metadata.decont.deRep.noNA, permutations = 99999)
+
+mod5a <- adonis(isl_dist.noNA ~ source + sex + month_collected + weight, data=metadata.decont.deRep.noNA, permutations = 99999)
+
+mod6a <- adonis(isl_dist.noNA ~ source + month_collected + weight, data=metadata.decont.deRep.noNA, permutations = 99999)
+
+mod7a <- adonis(isl_dist.noNA ~ source + month_collected, data=metadata.decont.deRep.noNA, permutations = 99999)
+
+
+# function to do AIC and reformat adonis output so I can put them together
+modTest <- function(model) {
+  aic.x <- AICc.PERMANOVA(model)
+  mod.x <- as.data.frame(cbind(model$aov.tab$Df, round(model$aov.tab$SumsOfSqs), round(model$aov.tab$MeanSqs, digits = 2), signif(model$aov.tab$F.Model, digits = 2), signif(model$aov.tab$R2, digits = 2), signif(model$aov.tab$`Pr(>F)`, digits = 3), aic.x$AIC))
+ # mod.x <- mod.x[length(nrow(model$aov.tab))-2,] # remove residuals
+  colnames(mod.x) <- c('Df','sumSq', 'meanSq', 'F', 'R2', 'P', 'AIC')
+  rownames(mod.x) <- rownames(model$aov.tab)
+ return(mod.x)
+}
+
+# Run the function on all the model outputs
+mod0 <-modTest(mod0a)
+mod1 <-modTest(mod1a)
+mod2 <-modTest(mod2a)
+mod3 <-modTest(mod3a)
+mod4 <-modTest(mod4a)
+mod5 <-modTest(mod5a)
+mod6 <-modTest(mod6a)
+mod7 <-modTest(mod7a)
+
+mod0$mod <- deparse(substitute(mod0))
+
+# function to add the name of the model as a column to the output
+fun.1 <- function(mt) {
+  mt$mod <- deparse(substitute(mt))
+  return(mt)
+}
+
+# Run the function on all the models
+mod0 <- fun.1(mod0)
+mod1 <- fun.1(mod1)
+mod2 <- fun.1(mod2)
+mod3 <- fun.1(mod3)
+mod4 <- fun.1(mod4)
+mod5 <- fun.1(mod5)
+mod6 <- fun.1(mod6)
+mod7 <- fun.1(mod7)
+
+mod.all <- rbind(mod0, mod1, mod2, mod3, mod4, mod5, mod6, mod7)
+
+hilite.p <- mod.all$P < 0.05
+hilite.p[is.na(hilite.p)] <- "FALSE"
+
+
+isl.kable <- kable(mod.all[1:7] %>% rownames_to_column('var') %>% arrange(AIC) %>% column_to_rownames('var'), caption = "PERMANOVA and model testing results sorted by AIC") %>% kable_styling(fixed_thead = T) %>%
+ # column_spec(8, color=spec_color(mod.all$AIC, end=0.7)) %>%
+ # column_spec(7, bold=hilite.p) %>%
+  pack_rows("isl_dist.noNA ~ source + month_collected + weight", 1, 5) %>%
+  pack_rows("isl_dist.noNA ~ source + month_collected", 6, 9) %>%
+  pack_rows("isl_dist.noNA ~ source + sex + month_collected + weight", 10, 15) %>%
+  pack_rows("isl_dist.noNA ~ source + sex + year_collected + month_collected + weight", 16, 22) %>%
+  pack_rows("isl_dist.noNA ~ source + sex + age + year_collected + month_collected + weight", 23, 30) %>%
+  pack_rows("isl_dist.noNA ~ source + sex + condition + age + year_collected + month_collected + weight", 31, 39) %>%
+  pack_rows("isl_dist.noNA ~ source + sex + condition + age + year_collected + month_collected + weight + extracted.group", 40, 49) %>%
+  pack_rows("isl_dist.noNA ~ sex", 50, 52) 
+
+isl.kable
+
+
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+### Multivariate analyses, SMI
+#### Data wrangling - SMI
+First remove samples with missing data bc they can't go through the betadisper() function. Then re-do the data transformation on new complete dataset. Note there are only 6 SMI samples after filtering out missing data.
+```{r, warning=FALSE, message=FALSE}
+# Make dataset
+SMI.noRep <- subset_samples(ASVs.B1.noRep, source == "SMI") # N=13
+
+metadata.SMI <- subset(metadata.decont.deRep, subset= source == "SMI")
+metadata.SMI.noNA <- metadata.SMI[complete.cases(metadata.SMI),] # N=6
+SMI.diff <- setdiff(metadata.SMI$id, metadata.SMI.noNA$id)
+SMI.noRep.noNA <- subset_samples(SMI.noRep, id_merge != "SMI.11" & id_merge != "SMI.16" & id_merge != "SMI.5" & id_merge != "SMI.6" & id_merge != "SMI.7" & id_merge != "SMI.8" & id_merge != "SMI.9" )
+
+SMI_deseq <- phyloseq_to_deseq2(SMI.noRep.noNA, ~ sex)
+SMI_deseq2 <- estimateSizeFactors(SMI_deseq, type="poscounts") #poscounts fixes the issues with zero counts
+SMI_vst <- varianceStabilizingTransformation(SMI_deseq2)
+SMI_trans_count_tab <- assay(SMI_vst)
+SMI_trans_count_tab[SMI_trans_count_tab < 0] <- 0
+SMI_dist.noNA <- t(SMI_trans_count_tab)
+#SMI_dist.noNA <- vegdist(SMI_dist.noNA, method="euclidean", diag = TRUE)
+SMI_dist.noNA <- vegdist(SMI_dist.noNA, method="bray", diag = TRUE)
+
+```
+
+&nbsp;
+
+#### Test for homogeneity - SMI
+```{r, warning=FALSE, message=FALSE}
+# reformat function for islands
+geneity2 <- function(dist, var1, nam){
+  homogA <- anova(betadisper(dist, var1))
+  homogB <- as.data.frame(cbind(homogA$Df, round(homogA$`Sum Sq`), round(homogA$`Mean Sq`, digits = 2), signif(homogA$`F value`, digits = 2), signif(homogA$`Pr(>F)`, digits = 3)))
+  homog <- homogB[1,] # remove residuals
+  colnames(homog) <- c('Df','sumSq', 'meanSq', 'F', 'P')
+  rownames(homog) <- paste(nam)
+  return(homog)
+}
+
+SMI.gen1 <- geneity2(SMI_dist.noNA, metadata.SMI.noNA$sex, "sex")
+SMI.gen2 <- geneity2(SMI_dist.noNA, metadata.SMI.noNA$condition, "condition")
+SMI.gen3 <- geneity2(SMI_dist.noNA, metadata.SMI.noNA$age, "age")
+SMI.gen4 <- geneity2(SMI_dist.noNA, metadata.SMI.noNA$year_collected, "yearCollected")
+SMI.gen5 <- geneity2(SMI_dist.noNA, metadata.SMI.noNA$month_collected, "monthCollected")
+SMI.gen6 <- geneity2(SMI_dist.noNA, metadata.SMI.noNA$weight, "weight")
+SMI.gen7 <- geneity2(SMI_dist.noNA, metadata.SMI.noNA$extracted.group, "extractGrp")
+
+SMI.gen.all <- as.data.frame(rbind(SMI.gen1, SMI.gen2, SMI.gen3, SMI.gen4, SMI.gen5, SMI.gen6, SMI.gen7))
+
+SMI.gen.all$P <- gsub("NA", "-", SMI.gen.all$P)
+
+kable(SMI.gen.all %>% rownames_to_column('var') %>% arrange(desc(P)) %>% column_to_rownames('var') , caption = "Test for homogeneity (betadisper) per variable - SMI")  %>% kable_styling() 
+
+```
+
+&nbsp;
+
+#### Model testing with AICc - SMI
+```{r, warning=FALSE, message=FALSE}
+# Test variables that passed the test for homogeneity
+SMI.mod0a <- adonis(SMI_dist.noNA ~ year_collected + sex, data=metadata.SMI.noNA, permutations = 99999)
+
+
+# Model testing by sequentially removed variables with low variance explained (R2)
+SMI.mod1a <- adonis(SMI_dist.noNA ~ sex + condition + age + year_collected + month_collected + weight + extracted.group, data=metadata.SMI.noNA, permutations = 99999)
+
+SMI.mod2a <- adonis(SMI_dist.noNA ~ condition + age + year_collected + month_collected + weight + extracted.group, data=metadata.SMI.noNA, permutations = 99999)
+
+SMI.mod3a <- adonis(SMI_dist.noNA ~ age + year_collected + month_collected + weight + extracted.group, data=metadata.SMI.noNA, permutations = 99999)
+
+SMI.mod4a <- adonis(SMI_dist.noNA ~ age + year_collected + weight + extracted.group, data=metadata.SMI.noNA, permutations = 99999)
+
+SMI.mod5a <- adonis(SMI_dist.noNA ~ year_collected + weight + extracted.group, data=metadata.SMI.noNA, permutations = 99999)
+
+SMI.mod6a <- adonis(SMI_dist.noNA ~ year_collected + extracted.group, data=metadata.SMI.noNA, permutations = 99999)
+
+SMI.mod7a <- adonis(SMI_dist.noNA ~ extracted.group, data=metadata.SMI.noNA, permutations = 99999)
+
+
+# Run the model test function on all the model outputs
+SMI.mod0 <-modTest(SMI.mod0a)
+SMI.mod1 <-modTest(SMI.mod1a)
+SMI.mod2 <-modTest(SMI.mod2a)
+SMI.mod3 <-modTest(SMI.mod3a)
+SMI.mod4 <-modTest(SMI.mod4a)
+SMI.mod5 <-modTest(SMI.mod5a)
+SMI.mod6 <-modTest(SMI.mod6a)
+SMI.mod7 <-modTest(SMI.mod7a)
+
+#SMI.mod.all <- rbind(SMI.mod0, SMI.mod1, SMI.mod2, SMI.mod3, SMI.mod4, SMI.mod5, SMI.mod6, SMI.mod7) # mods 1-3 result in AIC=NaN
+SMI.mod.all <- rbind(SMI.mod0, SMI.mod4, SMI.mod5, SMI.mod6, SMI.mod7)
+
+
+
+SMI.kable <- kable(SMI.mod.all %>% rownames_to_column('var') %>% arrange(AIC, P) %>% column_to_rownames('var'), caption = "SMI PERMANOVA and model testing results sorted by AIC") %>% kable_styling(fixed_thead = T) %>%
+  #column_specSMI.mod.all$(8, color=spec_color(AIC, end=0.7)) %>%
+  pack_rows("SMI_dist.noNA ~ age + year_collected + weight + extracted.group", 1, 6) %>%
+  pack_rows("SMI_dist.noNA ~ year_collected + weight + extracted.group", 7, 11) %>%
+  pack_rows("SMI_dist.noNA ~ year_collected + extracted.group", 12, 15) %>%
+  pack_rows("SMI_dist.noNA ~ extracted.group", 16, 18) %>%
+  pack_rows("SMI_dist.noNA ~ year_collected + sex", 19, 22) 
+
+SMI.kable
+  
+```
+
+&nbsp;
+
+#### PCoA - SMI
+```{r, warning=FALSE, message=FALSE}
+# PCOA
+SMI_count_phy <- otu_table(SMI_trans_count_tab, taxa_are_rows=T)
+SMI_sample_info_phy <- sample_data(SMI.noRep.noNA)
+SMI_physeq <- phyloseq(SMI_count_phy, SMI_sample_info_phy)
+#SMI_pcoa_euc <- ordinate(SMI_physeq, method="MDS", distance="euclidean")
+SMI_pcoa_euc <- ordinate(SMI_physeq, method="MDS", distance="bray")
+SMI_eigen_vals <- SMI_pcoa_euc$values$Eigenvalues
+
+SMI.pcoa.p <- plot_ordination(SMI_physeq, SMI_pcoa_euc, color="age", shape = "year_collected") + 
+  #labs(col="source") +
+  geom_point(size=7) + 
+  coord_fixed(sqrt(SMI_eigen_vals[2]/SMI_eigen_vals[1])) + ggtitle("SMI PCoA, bray") + 
+  #scale_color_manual(values = cols)  + #stat_ellipse() +
+  scale_color_viridis() +
+  theme_bw() + theme(text = element_text(size=15)) 
+
+#SMI.pcoa.p
+
+```
+
+
+&nbsp;
+&nbsp;
+&nbsp;
+
+### Multivariate analyses, SRI
+#### Data wrangling - SRI
+```{r, warning=FALSE, message=FALSE}
+SRI.noRep <- subset_samples(ASVs.B1.noRep, source == "SRI") # N=13
+
+metadata.SRI <- subset(metadata.decont.deRep, subset= source == "SRI")
+metadata.SRI.noNA <- metadata.SRI[complete.cases(metadata.SRI),] # N=13
+SRI.diff <- setdiff(metadata.SRI$id, metadata.SRI.noNA$id)
+SRI.noRep.noNA <- SRI.noRep
+
+SRI_deseq <- phyloseq_to_deseq2(SRI.noRep.noNA, ~ sex)
+SRI_deseq2 <- estimateSizeFactors(SRI_deseq, type="poscounts") #poscounts fixes the issues with zero counts
+SRI_vst <- varianceStabilizingTransformation(SRI_deseq2)
+SRI_trans_count_tab <- assay(SRI_vst)
+SRI_trans_count_tab[SRI_trans_count_tab < 0] <- 0
+SRI_dist.noNA <- t(SRI_trans_count_tab)
+#SRI_dist.noNA <- vegdist(SRI_dist.noNA, method="euclidean", diag = TRUE)
+SRI_dist.noNA <- vegdist(SRI_dist.noNA, method="bray", diag = TRUE)
+
+```
+
+&nbsp;
+
+#### Test for homogeneity - SRI
+```{r, warning=FALSE, message=FALSE}
+
+SRI.gen1 <- geneity2(SRI_dist.noNA, metadata.SRI.noNA$sex, "sex")
+SRI.gen2 <- geneity2(SRI_dist.noNA, metadata.SRI.noNA$condition, "condition")
+SRI.gen3 <- geneity2(SRI_dist.noNA, metadata.SRI.noNA$age, "age")
+#SRI.gen4 <- geneity2(SRI_dist.noNA, metadata.SRI.noNA$year_collected, "yearCollected")
+SRI.gen5 <- geneity2(SRI_dist.noNA, metadata.SRI.noNA$month_collected, "monthCollected")
+SRI.gen6 <- geneity2(SRI_dist.noNA, metadata.SRI.noNA$weight, "weight")
+SRI.gen7 <- geneity2(SRI_dist.noNA, metadata.SRI.noNA$extracted.group, "extractGrp")
+
+SRI.gen.all <- as.data.frame(rbind(SRI.gen1, SRI.gen2, SRI.gen3, SRI.gen5, SRI.gen6, SRI.gen7))
+
+
+kable(SRI.gen.all %>% rownames_to_column('var') %>% arrange(desc(P)) %>% column_to_rownames('var') , caption = "Test for homogeneity (betadisper) per variable - SRI")  %>% kable_styling() 
+
+```
+
+&nbsp;
+
+#### Model testing with AICc - SRI
+```{r, warning=FALSE, message=FALSE}
+# Test variables that passed the test for homogeneity
+SRI.mod0a <- adonis(SRI_dist.noNA ~ condition + month_collected, data=metadata.SRI.noNA, permutations = 99999)
+SRI.mod0b <- adonis(SRI_dist.noNA ~ condition + month_collected + sex, data=metadata.SRI.noNA, permutations = 99999)
+
+# Model testing by sequentially removed variables with low variance explained (R2)
+SRI.mod1a <- adonis(SRI_dist.noNA ~ sex + condition + age +  month_collected + weight + extracted.group, data=metadata.SRI.noNA, permutations = 99999)
+
+SRI.mod2a <- adonis(SRI_dist.noNA ~ condition + age + month_collected + weight + extracted.group, data=metadata.SRI.noNA, permutations = 99999)
+
+SRI.mod3a <- adonis(SRI_dist.noNA ~ age + year_collected + month_collected + weight + extracted.group, data=metadata.SRI.noNA, permutations = 99999)
+
+SRI.mod4a <- adonis(SRI_dist.noNA ~ month_collected + weight + extracted.group, data=metadata.SRI.noNA, permutations = 99999)
+
+SRI.mod5a <- adonis(SRI_dist.noNA ~ month_collected + extracted.group, data=metadata.SRI.noNA, permutations = 99999)
+
+SRI.mod6a <- adonis(SRI_dist.noNA ~ month_collected, data=metadata.SRI.noNA, permutations = 99999)
+
+
+# Run the model test function on all the model outputs
+SRI.mod0 <-modTest(SRI.mod0a)
+SRI.mod0x <-modTest(SRI.mod0b)
+SRI.mod1 <-modTest(SRI.mod1a)
+SRI.mod2 <-modTest(SRI.mod2a)
+SRI.mod3 <-modTest(SRI.mod3a)
+SRI.mod4 <-modTest(SRI.mod4a)
+SRI.mod5 <-modTest(SRI.mod5a)
+SRI.mod6 <-modTest(SRI.mod6a)
+
+
+#SRI.mod.all <- rbind(SRI.mod0, SRI.mod1, SRI.mod2, SRI.mod3, SRI.mod4, SRI.mod5, SRI.mod6, SRI.mod7)
+SRI.mod.all <- rbind(SRI.mod0, SRI.mod0x, SRI.mod1, SRI.mod2, SRI.mod3, SRI.mod4, SRI.mod5, SRI.mod6)
+
+
+
+SRI.kable <- kable(SRI.mod.all %>% rownames_to_column('var') %>% arrange(AIC, P) %>% column_to_rownames('var'), caption = "SRI PERMANOVA and model testing results sorted by AIC") %>% kable_styling(fixed_thead = T) %>%
+  #column_specSRI.mod.all$(8, color=spec_color(AIC, end=0.7)) %>%
+  pack_rows("SRI_dist.noNA ~ month_collected", 1, 3) %>%
+  pack_rows("SRI_dist.noNA ~ month_collected + extracted.group", 4, 7) %>%
+  pack_rows("SRI_dist.noNA ~ month_collected + condition", 8, 11) %>%
+  pack_rows("SRI_dist.noNA ~ month_collected + extracted.group + weight", 12, 16) %>%
+  pack_rows("SRI_dist.noNA ~ month_collected + condition + sex", 17, 21) %>%
+  pack_rows("SRI_dist.noNA ~ month_collected + extracted.group + age + weight", 22, 27) %>%
+  pack_rows("SRI_dist.noNA ~ month_collected + extracted.group + age + weight + condition", 28, 34) %>%
+  pack_rows("SRI_dist.noNA ~ month_collected + extracted.group + age + weight + condition + sex", 35, 42) 
+
+SRI.kable
+  
+```
+
+&nbsp;
+
+#### PCoA - SRI
+```{r, warning=FALSE, message=FALSE}
+# PCOA
+SRI_count_phy <- otu_table(SRI_trans_count_tab, taxa_are_rows=T)
+SRI_sample_info_phy <- sample_data(SRI.noRep.noNA)
+SRI_physeq <- phyloseq(SRI_count_phy, SRI_sample_info_phy)
+#SRI_pcoa_euc <- ordinate(SRI_physeq, method="MDS", distance="euclidean")
+SRI_pcoa_euc <- ordinate(SRI_physeq, method="MDS", distance="bray")
+SRI_eigen_vals <- SRI_pcoa_euc$values$Eigenvalues
+
+SRI_physeq@sam_data$month_collected <- factor(SRI_physeq@sam_data$month_collected, levels = c("Nov", "Dec"))
+
+SRI.pcoa.pxx2 <- plot_ordination(SRI_physeq, SRI_pcoa_euc, shape = "month_collected") + 
+  geom_point(size=7, color= "royalblue2", fill="royalblue2") + 
+  coord_fixed(sqrt(SRI_eigen_vals[2]/SRI_eigen_vals[1])) + 
+  ggtitle("SRI") + 
+  scale_shape_manual(values = c(16, 79)) +
+  theme_bw() + theme(text = element_text(size=15)) + labs(shape="month")
+SRI.pcoa.pxx2$layers <- SRI.pcoa.pxx2$layers[-1] # remove double plotting by removing the original geom_point layer that was added by plot_ordination - https://github.com/joey711/phyloseq/issues/250
+
+
+SRI.pcoa.pxx2
+```
+
+&nbsp;
+
+#### Differential abundance - SRI
+```{r, warning=FALSE, message=FALSE}
+## diff abundance
+SRI_deseqx <- phyloseq_to_deseq2(SRI.noRep.noNA, ~ month_collected)
+SRI_deseqx2 <- estimateSizeFactors(SRI_deseqx, type="poscounts")
+SRI_deseq3 <- DESeq(SRI_deseqx2)
+SRI_deseq_res <- results(SRI_deseq3, alpha=0.01, contrast= c("month_collected", "Nov", "Dec"))  
+SRI_sigtab_res_deseq <- SRI_deseq_res[which(SRI_deseq_res$padj < 0.01), ] 
+SRI.sum <- summary(SRI_sigtab_res_deseq)
+
+
+SRI_sigtab_deseq_with_tax <- cbind(as(SRI_sigtab_res_deseq, "data.frame"), as(tax_table(SRI.noRep.noNA)[row.names(SRI_sigtab_res_deseq), ], "matrix"))
+
+SRI.sig.tax <- SRI_sigtab_deseq_with_tax[order(SRI_sigtab_deseq_with_tax$log2FoldChange, decreasing=T), ]
+SRI.sig.taxR <- SRI_sigtab_deseq_with_tax[order(SRI_sigtab_deseq_with_tax$log2FoldChange, decreasing=F), ]
+
+SRI.sig.tax.all <- rbind(SRI.sig.tax[1:3,], SRI.sig.taxR[1:3,])
+
+kable(SRI.sig.tax.all, caption = "Top signif diff abundant taxa - SRI ~ Month")  %>% kable_styling() %>%
+  pack_rows("More abundant in Nov", 1, 3) %>%
+  pack_rows("More abundant in Dec", 4, 6) 
+
+```
+
+&nbsp;
+
+#### Blast differentially abundant taxa - SRI
+Open rep-seq.qzv in Qiime View in a browser. Then find the ID for the top taxa and blast the sequence against the NCBI rRNA_typestrains/16S_ribosomal_RNA database using the 16S ribosomal RNA (Bacteria and Archaea type strains) filter. NCBI 16S [directions](https://ncbiinsights.ncbi.nlm.nih.gov/2020/02/21/rrna-databases/)
+
+&nbsp;
+
+```{r, warning=FALSE, message=FALSE}
+nov.tax <- c("79b4767bedcb8bbb569be837c0e91fc9", "Diplorickettsia massiliensis 20B", "NR_117407.1", 98.01, 431)
+dec.tax <- c("e42382ea3fa1149094d507e3167e462b", "Rosenbergiella australiborealis strain CdVSA 20.1", "NR_126305.1", 100.00, 453)
+
+SRI.tax.tab <- as.data.frame(rbind(nov.tax,dec.tax))
+colnames(SRI.tax.tab) <- c("ASV", "BlastHit", "Accession", "PercIdentity", "MaxScore")
+rownames(SRI.tax.tab) <- c()
+SRI.sig.tax.all$ASV <- rownames(SRI.sig.tax.all)
+SRI.tax.tab <- inner_join(SRI.sig.tax.all, SRI.tax.tab, by="ASV") %>% select(ASV, log2FoldChange, lfcSE, padj, Genus, BlastHit, Accession, PercIdentity, MaxScore)
+
+dt_url <- c("https://www.ncbi.nlm.nih.gov/nucleotide/NR_117407.1?report=genbank&log$=nucltop&blast_rank=1&RID=RCZE02J6014", "https://www.ncbi.nlm.nih.gov/nucleotide/NR_126305.1?report=genbank&log$=nucltop&blast_rank=1&RID=RCY9URVR014")
+
+SRI.tax.tab <- SRI.tax.tab %>% mutate(Acession = cell_spec(Accession, "html", link=dt_url))
+
+kable(SRI.tax.tab, caption = "Blast results top signif diff abundant taxa - SRI ~ Month", escape = F)  %>% kable_styling()
+  
+
+```
+
+&nbsp;
+
+#### Plot SRI precipitation
+Precip data from Western Regional Climate Center [link](https://raws.dri.edu/)
+```{r, warning=FALSE, message=FALSE}
+# Plot SRI rain
+rain <- read.table("/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/SRI_2014-2015_Rain.csv", sep= ",", header=TRUE)
+rain$Date <- as.Date(rain$Date, "%m/%d/%Y")
+rain$Year <- factor(rain$Year)
+rain$Season <- as.factor(ifelse(rain$Day_of_Run < 91, "Fall", "Winter"))
+rain$Month <- as.factor(format(rain$Date, "%m"))
+rain$Month <- factor(rain$Month, levels=c("09", "10", "11", "12", "01", "02", "03"))
+
+# add collection dates
+coll <- SRI.noRep@sam_data
+coll$ID <- rownames(coll)
+coll.sub <- coll[,c(7:8, 22)]
+colnames(coll.sub) <- c("Date", "Year", "ID")
+coll.sub$Date <- as.Date(coll.sub$Date, format='%d-%b-%y')
+coll.sub$Year <- factor(coll.sub$Year)
+
+rain.coll <- merge(rain, coll.sub, all=TRUE)
+rain.coll$Date <- as.Date(rain.coll$Date, format='%Y-%m-%d')
+
+library(lubridate)
+rain.coll["month"] <- as.factor(month(rain.coll$Date))
+rain.coll$month <- factor(rain.coll$month, levels=c("9", "10", "11", "12", "1", "2", "3"))
+rain.coll$Isl <- "SRI"
+
+rain.p2xx2 <- ggplot(data=rain.coll, aes(x=Date, y=Tot_Precip, fill=Isl, ymax=Tot_Precip, ymin=0)) +
+   # geom_area(alpha = 0.9, position = position_dodge(0.8), show.legend = F) +
+  geom_ribbon(show.legend = F) +
+    geom_vline(xintercept = coll.sub$Date, linetype = "dashed", color="black", size=1) +
+    xlab("2014-2015") +
+    ylab("Total precipitation (mm)") +
+    #scale_fill_manual(values = c("gray","gray", "purple4", "yellowgreen", "gray","gray", "gray")) +
+    scale_fill_manual(values = "royalblue2") +
+    theme_bw() + ggtitle("SRI")+
+    theme(text = element_text(size=15))
+
+rain.p2xx2
+
+```
+
+&nbsp;
+
+#### Differential abundance - SRI - GENUS level
+https://github.com/joey711/phyloseq/issues/683#issuecomment-269682100
+```{r, warning=FALSE, message=FALSE}
+## filter phyloseq obj to genus level
+#GenusFiltered <- subset_taxa(SRI.noRep.noNA, !is.na(Genus) & is.na(Species))
+SRI_GenusFiltered <- subset_taxa(SRI.noRep.noNA, Genus != "g__" & Species == "s__")
+SRI_physeqGenus = tax_glom(SRI_GenusFiltered, "Genus")
+
+## diff abundance
+SRI_deseqx_g <- phyloseq_to_deseq2(SRI_physeqGenus, ~ month_collected)
+SRI_deseqx2_g <- estimateSizeFactors(SRI_deseqx_g, type="poscounts")
+SRI_deseq3_g <- DESeq(SRI_deseqx2_g)
+SRI_deseq_res_g <- results(SRI_deseq3_g, alpha=0.01, contrast= c("month_collected", "Nov", "Dec"))  
+SRI_sigtab_res_deseq_g <- SRI_deseq_res_g[which(SRI_deseq_res_g$padj < 0.01), ] 
+SRI.sum_g <- summary(SRI_sigtab_res_deseq_g)
+
+
+SRI_sigtab_deseq_with_tax_g <- cbind(as(SRI_sigtab_res_deseq_g, "data.frame"), as(tax_table(SRI_physeqGenus)[row.names(SRI_sigtab_res_deseq_g), ], "matrix"))
+
+SRI.sig.tax_g <- SRI_sigtab_deseq_with_tax_g[order(SRI_sigtab_deseq_with_tax_g$log2FoldChange, decreasing=T), ]
+SRI.sig.taxR_g <- SRI_sigtab_deseq_with_tax_g[order(SRI_sigtab_deseq_with_tax_g$log2FoldChange, decreasing=F), ]
+
+SRI.sig.tax.all_g <- rbind(SRI.sig.tax_g[1:3,])
+
+kable(SRI.sig.tax.all_g, caption = "Top signif diff abundant GENERA - SRI ~ Month")  %>% kable_styling() %>%
+  pack_rows("More abundant in Nov", 1, 2) %>%
+  pack_rows("More abundant in Dec", 3,3 ) 
+```
+
+
+&nbsp;
+&nbsp;
+&nbsp;
+
+### Multivariate analyses, CAT
+#### Data wrangling - CAT
+```{r, warning=FALSE, message=FALSE}
+# Make dataset
+CAT.noRep <- subset_samples(ASVs.B1.noRep, source == "CAT") # N=15
+
+metadata.CAT <- subset(metadata.decont.deRep, subset= source == "CAT")
+metadata.CAT.noNA <- metadata.CAT[complete.cases(metadata.CAT),] # N=15
+CAT.diff <- setdiff(metadata.CAT$id, metadata.CAT.noNA$id)
+CAT.noRep.noNA <- CAT.noRep
+
+CAT_deseq <- phyloseq_to_deseq2(CAT.noRep.noNA, ~ sex)
+CAT_deseq2 <- estimateSizeFactors(CAT_deseq, type="poscounts") #poscounts fixes the issues with zero counts
+CAT_vst <- varianceStabilizingTransformation(CAT_deseq2)
+CAT_trans_count_tab <- assay(CAT_vst)
+CAT_trans_count_tab[CAT_trans_count_tab < 0] <- 0
+CAT_dist.noNA <- t(CAT_trans_count_tab)
+#CAT_dist.noNA <- vegdist(CAT_dist.noNA, method="euclidean", diag = TRUE)
+CAT_dist.noNA <- vegdist(CAT_dist.noNA, method="bray", diag = TRUE)
+
+```
+
+&nbsp;
+
+#### Test for homogeneity - CAT
+```{r, warning=FALSE, message=FALSE}
+CAT.gen1 <- geneity2(CAT_dist.noNA, metadata.CAT.noNA$sex, "sex")
+CAT.gen2 <- geneity2(CAT_dist.noNA, metadata.CAT.noNA$condition, "condition")
+CAT.gen3 <- geneity2(CAT_dist.noNA, metadata.CAT.noNA$age, "age")
+CAT.gen4 <- geneity2(CAT_dist.noNA, metadata.CAT.noNA$year_collected, "yearCollected")
+CAT.gen5 <- geneity2(CAT_dist.noNA, metadata.CAT.noNA$month_collected, "monthCollected")
+CAT.gen6 <- geneity2(CAT_dist.noNA, metadata.CAT.noNA$weight, "weight")
+CAT.gen7 <- geneity2(CAT_dist.noNA, metadata.CAT.noNA$extracted.group, "extractGrp")
+
+CAT.gen.all <- as.data.frame(rbind(CAT.gen1, CAT.gen2, CAT.gen3, CAT.gen4, CAT.gen5, CAT.gen6, CAT.gen7))
+
+
+kable(CAT.gen.all %>% rownames_to_column('var') %>% arrange(desc(P)) %>% column_to_rownames('var') , caption = "Test for homogeneity (betadisper) per variable - CAT")  %>% kable_styling() 
+
+```
+
+&nbsp;
+
+#### Model testing with AICc - CAT
+```{r, warning=FALSE, message=FALSE}
+# Test variables that passed the test for homogeneity
+CAT.mod0a <- adonis(CAT_dist.noNA ~ sex, data=metadata.CAT.noNA, permutations = 99999)
+
+# Model testing by sequentially removed variables with low variance explained (R2)
+CAT.mod1a <- adonis(CAT_dist.noNA ~ sex + condition + age + year_collected + month_collected + weight + extracted.group, data=metadata.CAT.noNA, permutations = 99999)
+
+CAT.mod2a <- adonis(CAT_dist.noNA ~ sex + condition + year_collected + month_collected + weight + extracted.group, data=metadata.CAT.noNA, permutations = 99999)
+
+CAT.mod3a <- adonis(CAT_dist.noNA ~ sex + condition + year_collected + month_collected + extracted.group, data=metadata.CAT.noNA, permutations = 99999)
+
+CAT.mod4a <- adonis(CAT_dist.noNA ~ sex + condition + month_collected + extracted.group, data=metadata.CAT.noNA, permutations = 99999)
+
+CAT.mod5a <- adonis(CAT_dist.noNA ~ sex + condition + month_collected, data=metadata.CAT.noNA, permutations = 99999)
+
+CAT.mod6a <- adonis(CAT_dist.noNA ~ sex + month_collected, data=metadata.CAT.noNA, permutations = 99999)
+
+
+# Run the model test function on all the model outputs
+CAT.mod0 <-modTest(CAT.mod0a)
+CAT.mod1 <-modTest(CAT.mod1a)
+CAT.mod2 <-modTest(CAT.mod2a)
+CAT.mod3 <-modTest(CAT.mod3a)
+CAT.mod4 <-modTest(CAT.mod4a)
+CAT.mod5 <-modTest(CAT.mod5a)
+CAT.mod6 <-modTest(CAT.mod6a)
+
+
+CAT.mod.all <- rbind(CAT.mod0, CAT.mod1, CAT.mod2, CAT.mod3, CAT.mod4, CAT.mod5, CAT.mod6)
+
+
+
+CAT.kable <- kable(CAT.mod.all %>% rownames_to_column('var') %>% arrange(AIC, P) %>% column_to_rownames('var'), caption = "CAT PERMANOVA and model testing results sorted by AIC") %>% kable_styling(fixed_thead = T) %>%
+  #column_specCAT.mod.all$(8, color=spec_color(AIC, end=0.7)) %>%
+  pack_rows("CAT_dist.noNA ~ sex", 1, 3) %>%
+  pack_rows("CAT_dist.noNA ~ sex + month_collected", 4, 7) %>%
+  pack_rows("CAT_dist.noNA ~ sex + month_collected + condition", 8, 12) %>%
+  pack_rows("CAT_dist.noNA ~ sex + month_collected + condition + year_collected + age + weight + extracted.group", 13, 21) %>%
+  pack_rows("CAT_dist.noNA ~ sex + month_collected + condition + extracted.group", 22, 27) %>%
+  pack_rows("CAT_dist.noNA ~ sex + month_collected + condition + extracted.group + weight + year_collected", 28, 35) %>%
+  pack_rows("CAT_dist.noNA ~ sex + month_collected + condition + extracted.group + year_collected", 36,42)
+
+CAT.kable
+  
+```
+
+&nbsp;
+
+#### PCoA - CAT
+```{r, warning=FALSE, message=FALSE}
+# PCOA
+CAT_count_phy <- otu_table(CAT_trans_count_tab, taxa_are_rows=T)
+CAT_sample_info_phy <- sample_data(CAT.noRep.noNA)
+CAT_physeq <- phyloseq(CAT_count_phy, CAT_sample_info_phy)
+#CAT_pcoa_euc <- ordinate(CAT_physeq, method="MDS", distance="euclidean")
+CAT_pcoa_euc <- ordinate(CAT_physeq, method="MDS", distance="bray")
+CAT_eigen_vals <- CAT_pcoa_euc$values$Eigenvalues
+
+CAT.pcoa.pxx2 <- plot_ordination(CAT_physeq, CAT_pcoa_euc, shape="sex") + 
+  labs(col="sex", shape="sex") +
+  geom_point(size=7, color= "darkred", fill="darkred") + 
+    coord_fixed(sqrt(CAT_eigen_vals[2]/CAT_eigen_vals[1])) +
+  scale_shape_manual(values = c(16, 79)) +
+  ggtitle("CAT") + 
+  theme_bw() + theme(text = element_text(size=15)) 
+CAT.pcoa.pxx2$layers <- CAT.pcoa.pxx2$layers[-1]
+
+CAT.pcoa.pxx2
+
+```
+
+&nbsp;
+
+#### Differential abundance - CAT
+```{r, warning=FALSE, message=FALSE}
+## diff abundance
+CAT_deseqx <- phyloseq_to_deseq2(CAT.noRep.noNA, ~ sex)
+CAT_deseqx2 <- estimateSizeFactors(CAT_deseqx, type="poscounts")
+CAT_deseq3 <- DESeq(CAT_deseqx2)
+CAT_deseq_res <- results(CAT_deseq3, alpha=0.01, contrast= c("sex", "F", "M"))  
+CAT_sigtab_res_deseq <- CAT_deseq_res[which(CAT_deseq_res$padj < 0.01), ] 
+CAT.sum <- summary(CAT_sigtab_res_deseq)
+
+
+CAT_sigtab_deseq_with_tax <- cbind(as(CAT_sigtab_res_deseq, "data.frame"), as(tax_table(CAT.noRep.noNA)[row.names(CAT_sigtab_res_deseq), ], "matrix"))
+
+CAT.sig.tax <- CAT_sigtab_deseq_with_tax[order(CAT_sigtab_deseq_with_tax$log2FoldChange, decreasing=T), ]
+CAT.sig.taxR <- CAT_sigtab_deseq_with_tax[order(CAT_sigtab_deseq_with_tax$log2FoldChange, decreasing=F), ]
+CAT.sig.tax.all <- rbind(CAT.sig.tax[1:3,], CAT.sig.taxR[1:3,])
+
+kable(CAT.sig.tax.all, caption = "Top signif diff abundant taxa - CAT ~ sex")  %>% kable_styling() %>%
+  pack_rows("More abundant in Females", 1, 3) %>%
+  pack_rows("More abundant in Males", 4, 6) 
+
+```
+
+&nbsp;
+
+#### Blast top differentially abundant taxa - CAT
+```{r, warning=FALSE, message=FALSE}
+CAT.F.tax <- c("290aac7b5cfcb9e70ca98c874f099965", "Fusobacterium mortiferum strain DSM 19809", "NR_117734.1", 98.80, 448)
+CAT.M.tax <- c("b15f5845058247119ae560a6b19e2e4d", "Faecalibacterium prausnitzii strain ATCC 27768", "NR_028961.1", 98.41, 442)
+
+CAT.tax.tab <- as.data.frame(rbind(CAT.F.tax,CAT.M.tax))
+colnames(CAT.tax.tab) <- c("ASV", "BlastHit", "Accession", "PercIdentity", "MaxScore")
+rownames(CAT.tax.tab) <- c()
+CAT.sig.tax.all$ASV <- rownames(CAT.sig.tax.all)
+CAT.tax.tab <- inner_join(CAT.sig.tax.all, CAT.tax.tab, by="ASV") %>% select(ASV, log2FoldChange, lfcSE, padj, Genus, BlastHit, Accession, PercIdentity, MaxScore)
+
+CAT_url <- c("https://www.ncbi.nlm.nih.gov/nucleotide/NR_117734.1?report=genbank&log$=nucltop&blast_rank=1&RID=RD0RTC90016", "https://www.ncbi.nlm.nih.gov/nucleotide/NR_028961.1?report=genbank&log$=nucltop&blast_rank=1&RID=RD0Z8BS001R")
+
+CAT.tax.tab <- CAT.tax.tab %>% mutate(Acession = cell_spec(Accession, "html", link=CAT_url))
+
+kable(CAT.tax.tab, caption = "Blast results top signif diff abundant taxa - CAT ~ sex", escape =F )  %>% kable_styling()
+  
+
+```
+
+&nbsp;
+
+#### Differential abundance - CAT - GENUS level
+https://github.com/joey711/phyloseq/issues/683#issuecomment-269682100
+```{r, warning=FALSE, message=FALSE}
+## filter phyloseq obj to genus level
+#GenusFiltered <- subset_taxa(CAT.noRep.noNA, !is.na(Genus) & is.na(Species))
+CAT_GenusFiltered <- subset_taxa(CAT.noRep.noNA, Genus != "g__" & Species == "s__")
+CAT_physeqGenus = tax_glom(CAT_GenusFiltered, "Genus")
+
+## diff abundance
+CAT_deseqx_g <- phyloseq_to_deseq2(CAT_physeqGenus, ~ sex)
+CAT_deseqx2_g <- estimateSizeFactors(CAT_deseqx_g, type="poscounts")
+CAT_deseq3_g <- DESeq(CAT_deseqx2_g)
+CAT_deseq_res_g <- results(CAT_deseq3_g, alpha=0.01, contrast= c("sex", "F", "M"))  
+CAT_sigtab_res_deseq_g <- CAT_deseq_res_g[which(CAT_deseq_res_g$padj < 0.01), ] 
+CAT.sum_g <- summary(CAT_sigtab_res_deseq_g)
+
+
+CAT_sigtab_deseq_with_tax_g <- cbind(as(CAT_sigtab_res_deseq_g, "data.frame"), as(tax_table(CAT_physeqGenus)[row.names(CAT_sigtab_res_deseq_g), ], "matrix"))
+
+CAT.sig.tax_g <- CAT_sigtab_deseq_with_tax_g[order(CAT_sigtab_deseq_with_tax_g$log2FoldChange, decreasing=T), ]
+CAT.sig.taxR_g <- CAT_sigtab_deseq_with_tax_g[order(CAT_sigtab_deseq_with_tax_g$log2FoldChange, decreasing=F), ]
+
+CAT.sig.tax.all_g <- rbind(CAT.sig.tax_g[1:2,])
+
+kable(CAT.sig.tax.all_g, caption = "Top signif diff abundant GENERA - CAT ~ sex")  %>% kable_styling() %>%
+  pack_rows("More abundant in Females", 1, 1) %>%
+  pack_rows("More abundant in Males", 2,2 ) 
+
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+
+### Multivariate analyses, SCL
+#### Data wrangling - SCL
+```{r, warning=FALSE, message=FALSE}
+# Make dataset
+SCL.noRep <- subset_samples(ASVs.B1.noRep, source == "SCL") # N=16
+
+metadata.SCL <- subset(metadata.decont.deRep, subset= source == "SCL")
+metadata.SCL.noNA <- metadata.SCL[complete.cases(metadata.SCL),] # N=15
+SCL.diff <- setdiff(metadata.SCL$id, metadata.SCL.noNA$id)
+SCL.noRep.noNA <- subset_samples(SCL.noRep, id_merge != "SCL.20.2") # N=15
+
+SCL_deseq <- phyloseq_to_deseq2(SCL.noRep.noNA, ~ sex)
+SCL_deseq2 <- estimateSizeFactors(SCL_deseq, type="poscounts") #poscounts fixes the issues with zero counts
+SCL_vst <- varianceStabilizingTransformation(SCL_deseq2)
+SCL_trans_count_tab <- assay(SCL_vst)
+SCL_trans_count_tab[SCL_trans_count_tab < 0] <- 0
+SCL_dist.noNA <- t(SCL_trans_count_tab)
+#SCL_dist.noNA <- vegdist(SCL_dist.noNA, method="euclidean", diag = TRUE)
+SCL_dist.noNA <- vegdist(SCL_dist.noNA, method="bray", diag = TRUE)
+ 
+```
+
+&nbsp;
+
+#### Test for homogeneity - SCL
+```{r, warning=FALSE, message=FALSE}
+SCL.gen1 <- geneity2(SCL_dist.noNA, metadata.SCL.noNA$sex, "sex")
+SCL.gen2 <- geneity2(SCL_dist.noNA, metadata.SCL.noNA$condition, "condition")
+SCL.gen3 <- geneity2(SCL_dist.noNA, metadata.SCL.noNA$age, "age")
+SCL.gen4 <- geneity2(SCL_dist.noNA, metadata.SCL.noNA$year_collected, "yearCollected")
+SCL.gen5 <- geneity2(SCL_dist.noNA, metadata.SCL.noNA$month_collected, "monthCollected")
+SCL.gen6 <- geneity2(SCL_dist.noNA, metadata.SCL.noNA$weight, "weight")
+SCL.gen7 <- geneity2(SCL_dist.noNA, metadata.SCL.noNA$extracted.group, "extractGrp")
+
+SCL.gen.all <- as.data.frame(rbind(SCL.gen1, SCL.gen2, SCL.gen3, SCL.gen4, SCL.gen5, SCL.gen6, SCL.gen7))
+
+
+kable(SCL.gen.all %>% rownames_to_column('var') %>% arrange(desc(P)) %>% column_to_rownames('var') , caption = "Test for homogeneity (betadisper) per variable - SCL")  %>% kable_styling() 
+
+```
+
+&nbsp;
+
+#### Model testing with AICc - SCL
+```{r, warning=FALSE, message=FALSE}
+# Test variables that passed the test for homogeneity
+SCL.mod0a <- adonis(SCL_dist.noNA ~ sex + condition + extracted.group, data=metadata.SCL.noNA, permutations = 99999)
+
+# Model testing by sequentially removed variables with low variance explained (R2)
+SCL.mod1a <- adonis(SCL_dist.noNA ~ sex + condition + age + year_collected + month_collected + weight + extracted.group, data=metadata.SCL.noNA, permutations = 99999)
+
+SCL.mod2a <- adonis(SCL_dist.noNA ~ sex + condition + age + year_collected + month_collected + weight, data=metadata.SCL.noNA, permutations = 99999)
+
+SCL.mod3a <- adonis(SCL_dist.noNA ~ condition + age + year_collected + month_collected + weight, data=metadata.SCL.noNA, permutations = 99999)
+
+SCL.mod4a <- adonis(SCL_dist.noNA ~ age + year_collected + month_collected + weight, data=metadata.SCL.noNA, permutations = 99999)
+
+SCL.mod5a <- adonis(SCL_dist.noNA ~ year_collected + month_collected + weight, data=metadata.SCL.noNA, permutations = 99999)
+
+SCL.mod6a <- adonis(SCL_dist.noNA ~  month_collected + weight, data=metadata.SCL.noNA, permutations = 99999)
+
+SCL.mod7a <- adonis(SCL_dist.noNA ~  year_collected + weight, data=metadata.SCL.noNA, permutations = 99999)
+
+
+# Run the model test function on all the model outputs
+SCL.mod0 <-modTest(SCL.mod0a)
+SCL.mod1 <-modTest(SCL.mod1a)
+SCL.mod2 <-modTest(SCL.mod2a)
+SCL.mod3 <-modTest(SCL.mod3a)
+SCL.mod4 <-modTest(SCL.mod4a)
+SCL.mod5 <-modTest(SCL.mod5a)
+SCL.mod6 <-modTest(SCL.mod6a)
+SCL.mod7 <-modTest(SCL.mod7a)
+
+SCL.mod.all <- rbind(SCL.mod0, SCL.mod1, SCL.mod2, SCL.mod3, SCL.mod4, SCL.mod5, SCL.mod6, SCL.mod7)
+
+
+SCL.kable <- kable(SCL.mod.all %>% rownames_to_column('var') %>% arrange(AIC, P) %>% column_to_rownames('var'), caption = "SCL PERMANOVA and model testing results sorted by AIC") %>% kable_styling(fixed_thead = T) %>%
+  #column_specSCL.mod.all$(8, color=spec_color(AIC, end=0.7)) %>%
+  pack_rows("SCL_dist.noNA ~ weight + year_collected", 1, 4) %>%
+  pack_rows("SCL_dist.noNA ~ weight + year_collected + month_collected", 5, 9) %>%
+  pack_rows("SCL_dist.noNA ~ weight + month_collected", 10, 13) %>%
+  pack_rows("SCL_dist.noNA ~ weight + year_collected + month_collected + sex + condition + age + extracted.group", 14, 22) %>%
+  pack_rows("SCL_dist.noNA ~ weight + year_collected + month_collected + age", 23, 28) %>%
+  pack_rows("SCL_dist.noNA ~ weight + year_collected + month_collected + age + condition + sex", 29, 36) %>%
+  pack_rows("SCL_dist.noNA ~ weight + year_collected + month_collected + age + condition", 37,43) %>%
+  pack_rows("SCL_dist.noNA ~ condition + sex + extracted.group", 44,48)
+
+SCL.kable
+
+```
+
+&nbsp;
+
+#### PCoA - SCL
+```{r}
+# PCOA
+SCL_count_phy <- otu_table(SCL_trans_count_tab, taxa_are_rows=T)
+SCL_sample_info_phy <- sample_data(SCL.noRep.noNA)
+SCL_physeq <- phyloseq(SCL_count_phy, SCL_sample_info_phy)
+#SCL_pcoa_euc <- ordinate(SCL_physeq, method="MDS", distance="euclidean")
+SCL_pcoa_euc <- ordinate(SCL_physeq, method="MDS", distance="bray")
+SCL_eigen_vals <- SCL_pcoa_euc$values$Eigenvalues
+
+SCL.pcoa.pxx2 <- plot_ordination(SCL_physeq, SCL_pcoa_euc, color="weight", shape = "year_collected") + 
+  labs(col="weight", shape="year") + geom_point(size=7) + 
+    coord_fixed(sqrt(SCL_eigen_vals[2]/SCL_eigen_vals[1])) + ggtitle("SCL") + 
+  scale_color_gradient(low = "wheat", high = "firebrick1") +
+  theme_bw() + theme(text = element_text(size=15))
+
+SCL.pcoa.pxx2
+```
+
+&nbsp;
+
+#### Differential abundance - SCL ~ year
+```{r, warning=FALSE, message=FALSE}
+## diff abundance
+SCL_deseqx <- phyloseq_to_deseq2(SCL.noRep.noNA, ~ year_collected)
+SCL_deseqx2 <- estimateSizeFactors(SCL_deseqx, type="poscounts")
+SCL_deseq3 <- DESeq(SCL_deseqx2)
+SCL_deseq_res <- results(SCL_deseq3, alpha=0.01, contrast= c("year_collected", "2014", "2015"))  
+SCL_sigtab_res_deseq <- SCL_deseq_res[which(SCL_deseq_res$padj < 0.01), ] 
+SCL.sum <- summary(SCL_sigtab_res_deseq)
+
+
+SCL_sigtab_deseq_with_tax <- cbind(as(SCL_sigtab_res_deseq, "data.frame"), as(tax_table(SCL.noRep.noNA)[row.names(SCL_sigtab_res_deseq), ], "matrix"))
+
+SCL.sig.tax <- SCL_sigtab_deseq_with_tax[order(SCL_sigtab_deseq_with_tax$log2FoldChange, decreasing=T), ]
+SCL.sig.taxR <- SCL_sigtab_deseq_with_tax[order(SCL_sigtab_deseq_with_tax$log2FoldChange, decreasing=F), ]
+SCL.sig.tax.all <- rbind(SCL.sig.tax[1:3,], SCL.sig.taxR[1:3,])
+
+kable(SCL.sig.tax.all, caption = "Top signif diff abundant taxa - SCL ~ year")  %>% kable_styling() %>%
+  pack_rows("More abundant in 2014", 1, 3) %>%
+  pack_rows("More abundant in 2015", 4, 6) 
+
+```
+
+&nbsp;
+
+#### Differential abundance - SCL ~ weight
+```{r, warning=FALSE, message=FALSE}
+## diff abundance
+SCL_deseqw <- phyloseq_to_deseq2(SCL.noRep.noNA, ~ weight)
+SCL_deseqw2 <- estimateSizeFactors(SCL_deseqw, type="poscounts")
+SCL_deseqw3 <- DESeq(SCL_deseqw2)
+SCL_deseq_res.w <- results(SCL_deseqw3, alpha=0.01, name="weight")  
+SCL_sigtab_res_deseq.w <- SCL_deseq_res.w[which(SCL_deseq_res.w$padj < 0.01), ] 
+#SCL.sum <- summary(SCL_sigtab_res_deseq.w)
+
+
+SCL_sigtab_deseq_with_tax.w <- cbind(as(SCL_sigtab_res_deseq.w, "data.frame"), as(tax_table(SCL.noRep.noNA)[row.names(SCL_sigtab_res_deseq.w), ], "matrix"))
+
+SCL.sig.tax.w <- SCL_sigtab_deseq_with_tax.w[order(SCL_sigtab_deseq_with_tax.w$log2FoldChange, decreasing=T), ]
+SCL.sig.tax2.wR <- SCL_sigtab_deseq_with_tax.w[order(SCL_sigtab_deseq_with_tax.w$log2FoldChange, decreasing=F), ]
+SCL.sig.tax.all.w <- rbind(SCL.sig.tax.w[1:3,], SCL.sig.tax2.wR[1:3,])
+
+kable(SCL.sig.tax.all.w, caption = "Top signif diff abundant taxa - SCL ~ weight") %>% kable_styling() %>%
+  pack_rows("More abundant in low wt", 1, 3) %>%
+  pack_rows("More abundant in high wt", 4, 6)
+
+```
+
+&nbsp;
+
+#### Blast top differentially abundant taxa - SCL
+```{r, warning=FALSE, message=FALSE}
+SCL.2014.tax <- c("13173fa1a3d63abc7f566a5a4cbf27bc", "Parasutterella secunda strain JCM 16078", "NR_113328.1", 95.63, 403)
+SCL.2015.tax <- c("3c994ad0917947698cf5235a951c4df0", "Bacteroides coprocola DSM 17136 strain M16", "NR_041278.1", 98.41, 442)
+SCL.hiWt.tax <- c("06c214f56026f8ffd260f153bd0cf856", "Prevotellamassilia timonensis strain Marseille-P2831", "NR_144750.1", 93.63, 375)
+SCL.lowWt.tax <- c("f62358a1dcad7653dddf044a1b7277c3", "Anaerofilum pentosovorans strain Fae", "NR_029313.1", 94.80, 390)
+
+SCL.tax.tab <- as.data.frame(rbind(SCL.2014.tax,SCL.2015.tax, SCL.hiWt.tax, SCL.lowWt.tax))
+colnames(SCL.tax.tab) <- c("ASV", "BlastHit", "Accession", "PercIdentity", "MaxScore")
+rownames(SCL.tax.tab) <- c()
+SCL.sig.tax.all.B <- as.data.frame(rbind(SCL.sig.tax.all,SCL.sig.tax.all.w))
+SCL.sig.tax.all.B$ASV <- rownames(SCL.sig.tax.all.B)
+SCL.tax.tab <- inner_join(SCL.sig.tax.all.B, SCL.tax.tab, by="ASV") %>% select(ASV, log2FoldChange, lfcSE, padj, Genus, BlastHit, Accession, PercIdentity, MaxScore)
+
+SCL_url <- c("https://www.ncbi.nlm.nih.gov/nucleotide/NR_113328.1?report=genbank&log$=nucltop&blast_rank=1&RID=RD1K2X7U014", "https://www.ncbi.nlm.nih.gov/nucleotide/NR_041278.1?report=genbank&log$=nucltop&blast_rank=1&RID=RD1PCPCD014", "https://www.ncbi.nlm.nih.gov/nucleotide/NR_144750.1?report=genbank&log$=nucltop&blast_rank=1&RID=RD1VWMHR014", "https://www.ncbi.nlm.nih.gov/nucleotide/NR_029313.1?report=genbank&log$=nucltop&blast_rank=1&RID=RD1Z3JCU016")
+
+SCL.tax.tab <- SCL.tax.tab %>% mutate(Acession = cell_spec(Accession, "html", link=SCL_url))
+
+kable(SCL.tax.tab, caption = "Blast results top signif diff abundant taxa - SCL ~ year, weight", escape =F )  %>% kable_styling()
+  
+
+```
+
+&nbsp;
+
+#### Plot SCL precipitation
+Precip data from Western Regional Climate Center, [link](https://raws.dri.edu/). I used the Hoeppel site data on SCL.
+```{r, warning=FALSE, message=FALSE}
+# Plot SRI rain
+SCL_rain <- read.table("/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/SCL_Hop_2014-2015_Rain.csv", sep= ",", header=TRUE)
+SCL_rain$Date <- as.Date(SCL_rain$Date, "%m/%d/%Y")
+SCL_rain$Year <- factor(SCL_rain$Year)
+SCL_rain$Season <- as.factor(ifelse(SCL_rain$Day_of_Run < 91, "Fall", "Winter"))
+SCL_rain$Month <- as.factor(format(SCL_rain$Date, "%m"))
+SCL_rain$Month <- factor(SCL_rain$Month, levels=c("09", "10", "11", "12", "01", "02", "03"))
+
+# add collection dates
+SCL.coll <- SCL.noRep@sam_data
+SCL.coll$ID <- rownames(SCL.coll)
+SCL.coll.sub <- SCL.coll[,c(7:8, 22)]
+colnames(SCL.coll.sub) <- c("Date", "Year", "ID")
+SCL.coll.sub$Date <- as.Date(SCL.coll.sub$Date, format='%d-%b-%y')
+SCL.coll.sub$Year <- factor(SCL.coll.sub$Year)
+
+SCL.rain.coll <- merge(SCL_rain, SCL.coll.sub, all=TRUE)
+SCL.rain.coll$Date <- as.Date(SCL.rain.coll$Date, format='%Y-%m-%d')
+
+SCL.rain.coll["month"] <- as.factor(month(SCL.rain.coll$Date))
+SCL.rain.coll$month <- factor(SCL.rain.coll$month, levels=c("9", "10", "11", "12", "1", "2", "3"))
+SCL.rain.coll$Isl <- "SCL"
+
+SCL.rain.p2xx2 <- ggplot(data=SCL.rain.coll, aes(x=Date, y=Tot_Precip, fill=Isl, ymax=Tot_Precip, ymin=0)) + 
+   geom_ribbon(show.legend = F) +
+    geom_vline(xintercept = SCL.coll.sub$Date, linetype = "dashed", color="black", size=1) +
+    xlab("2014-2015") +
+    ylab("Total precipitation (mm)") +
+  #scale_fill_manual(values = c("purple4","purple4", "purple4", "purple4", "yellowgreen","yellowgreen", "yellowgreen")) +
+  scale_fill_manual(values = "firebrick1") +
+    theme_bw() + ggtitle("SCL")+
+    theme(text = element_text(size=15))
+
+SCL.rain.p2xx2
+
+```
+
+&nbsp;
+
+#### Differential abundance - SCL ~ year - GENUS level
+https://github.com/joey711/phyloseq/issues/683#issuecomment-269682100
+```{r, warning=FALSE, message=FALSE}
+## filter phyloseq obj to genus level
+#GenusFiltered <- subset_taxa(SCL.noRep.noNA, !is.na(Genus) & is.na(Species))
+SCL_GenusFiltered <- subset_taxa(SCL.noRep.noNA, Genus != "g__" & Species == "s__")
+SCL_physeqGenus = tax_glom(SCL_GenusFiltered, "Genus")
+
+## diff abundance
+SCL_deseqx_g <- phyloseq_to_deseq2(SCL_physeqGenus, ~ year_collected)
+SCL_deseqx2_g <- estimateSizeFactors(SCL_deseqx_g, type="poscounts")
+SCL_deseq3_g <- DESeq(SCL_deseqx2_g)
+SCL_deseq_res_g <- results(SCL_deseq3_g, alpha=0.01, contrast= c("year_collected", "2014", "2015"))  
+SCL_sigtab_res_deseq_g <- SCL_deseq_res_g[which(SCL_deseq_res_g$padj < 0.01), ] 
+SCL.sum_g <- summary(SCL_sigtab_res_deseq_g)
+
+
+SCL_sigtab_deseq_with_tax_g <- cbind(as(SCL_sigtab_res_deseq_g, "data.frame"), as(tax_table(SCL_physeqGenus)[row.names(SCL_sigtab_res_deseq_g), ], "matrix"))
+
+SCL.sig.tax_g <- SCL_sigtab_deseq_with_tax_g[order(SCL_sigtab_deseq_with_tax_g$log2FoldChange, decreasing=T), ]
+SCL.sig.taxR_g <- SCL_sigtab_deseq_with_tax_g[order(SCL_sigtab_deseq_with_tax_g$log2FoldChange, decreasing=F), ]
+
+SCL.sig.tax.all_g <- rbind(SCL.sig.tax_g[1:4,])
+
+kable(SCL.sig.tax.all_g, caption = "Top signif diff abundant GENERA - SCL ~ year")  %>% kable_styling() %>%
+  pack_rows("More abundant in 2014", 1, 3) %>%
+  pack_rows("More abundant in 2015", 4,4 ) 
+
+```
+
+&nbsp;
+
+#### Differential abundance - SCL ~ weight - GENUS level
+https://github.com/joey711/phyloseq/issues/683#issuecomment-269682100
+```{r, warning=FALSE, message=FALSE}
+## filter phyloseq obj to genus level
+#GenusFiltered <- subset_taxa(SCL.noRep.noNA, !is.na(Genus) & is.na(Species))
+# SCL_GenusFiltered <- subset_taxa(SCL.noRep.noNA, Genus != "g__" & Species == "s__")
+# SCL_physeqGenus = tax_glom(SCL_GenusFiltered, "Genus")
+
+## diff abundance
+SCL_deseqx_g_w <- phyloseq_to_deseq2(SCL_physeqGenus, ~ weight)
+SCL_deseqx2_g_w <- estimateSizeFactors(SCL_deseqx_g_w, type="poscounts")
+SCL_deseq3_g_w <- DESeq(SCL_deseqx2_g_w)
+SCL_deseq_res_g_w <- results(SCL_deseq3_g_w, alpha=0.01, name = "weight")  
+SCL_sigtab_res_deseq_g_w <- SCL_deseq_res_g_w[which(SCL_deseq_res_g_w$padj < 0.01), ] 
+SCL.sum_g_w <- summary(SCL_sigtab_res_deseq_g_w)
+
+
+SCL_sigtab_deseq_with_tax_g_w <- cbind(as(SCL_sigtab_res_deseq_g_w, "data.frame"), as(tax_table(SCL_physeqGenus)[row.names(SCL_sigtab_res_deseq_g_w), ], "matrix"))
+
+SCL.sig.tax_g_w <- SCL_sigtab_deseq_with_tax_g_w[order(SCL_sigtab_deseq_with_tax_g_w$log2FoldChange, decreasing=T), ]
+SCL.sig.taxR_g_w <- SCL_sigtab_deseq_with_tax_g_w[order(SCL_sigtab_deseq_with_tax_g_w$log2FoldChange, decreasing=F), ]
+
+SCL.sig.tax.all_g_W <- rbind(SCL.sig.tax_g[1:1,])
+
+SCL.sig.tax.all_g_W
+
+# kable(SCL.sig.tax.all_g_W, caption = "Top signif diff abundant GENERA - SCL ~ weight")  %>% kable_styling() %>%
+#   pack_rows("More abundant in lower weigth", 1, 3) %>%
+#   pack_rows("More abundant in higher weight", 4,4 ) 
+
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+
+### Multivariate analyses, SNI
+#### Data wrangling - SNI
+```{r, warning=FALSE, message=FALSE}
+# Make dataset
+SNI.noRep <- subset_samples(ASVs.B1.noRep, source == "SNI") # N=14
+
+metadata.SNI <- subset(metadata.decont.deRep, subset= source == "SNI")
+metadata.SNI.noNA <- metadata.SNI[complete.cases(metadata.SNI),] # N=10
+SNI.diff <- setdiff(metadata.SNI$id, metadata.SNI.noNA$id)
+SNI.noRep.noNA <- subset_samples(SNI.noRep, id_merge != "SNI.10A" & id_merge != "SNI.17" & id_merge != "SNI.20" & id_merge != "SNI.2B") # N=10
+
+SNI_deseq <- phyloseq_to_deseq2(SNI.noRep.noNA, ~ sex)
+SNI_deseq2 <- estimateSizeFactors(SNI_deseq, type="poscounts") #poscounts fixes the issues with zero counts
+SNI_vst <- varianceStabilizingTransformation(SNI_deseq2)
+SNI_trans_count_tab <- assay(SNI_vst)
+SNI_trans_count_tab[SNI_trans_count_tab < 0] <- 0
+SNI_dist.noNA <- t(SNI_trans_count_tab)
+#SNI_dist.noNA <- vegdist(SNI_dist.noNA, method="euclidean", diag = TRUE)
+SNI_dist.noNA <- vegdist(SNI_dist.noNA, method="bray", diag = TRUE)
+ 
+```
+
+&nbsp;
+
+#### Test for homogeneity - SNI
+```{r, warning=FALSE, message=FALSE, knitr.kable.NA = '-'}
+SNI.gen1 <- geneity2(SNI_dist.noNA, metadata.SNI.noNA$sex, "sex")
+SNI.gen2 <- geneity2(SNI_dist.noNA, metadata.SNI.noNA$condition, "condition")
+SNI.gen3 <- geneity2(SNI_dist.noNA, metadata.SNI.noNA$age, "age")
+#SNI.gen4 <- geneity2(SNI_dist.noNA, metadata.SNI.noNA$year_collected, "yearCollected")
+SNI.gen5 <- geneity2(SNI_dist.noNA, metadata.SNI.noNA$month_collected, "monthCollected")
+SNI.gen6 <- geneity2(SNI_dist.noNA, metadata.SNI.noNA$weight, "weight")
+SNI.gen7 <- geneity2(SNI_dist.noNA, metadata.SNI.noNA$extracted.group, "extractGrp")
+
+SNI.gen.all <- as.data.frame(rbind(SNI.gen1, SNI.gen2, SNI.gen3, SNI.gen5, SNI.gen6, SNI.gen7))
+
+
+kable(SNI.gen.all %>% rownames_to_column('var') %>% arrange(desc(P)) %>% column_to_rownames('var') , caption = "Test for homogeneity (betadisper) per variable - SNI")  %>% kable_styling() 
+
+```
+
+&nbsp;
+
+#### Model testing with AICc - SNI
+```{r, warning=FALSE, message=FALSE}
+# Test variables that passed the test for homogeneity
+SNI.mod0a <- adonis(SNI_dist.noNA ~ condition, data=metadata.SNI.noNA, permutations = 99999)
+
+# Model testing by sequentially removed variables with low variance explained (R2)
+SNI.mod1a <- adonis(SNI_dist.noNA ~ sex + condition + age + month_collected + weight + extracted.group, data=metadata.SNI.noNA, permutations = 99999)
+
+SNI.mod2a <- adonis(SNI_dist.noNA ~ sex + condition + age + month_collected + weight, data=metadata.SNI.noNA, permutations = 99999)
+
+SNI.mod3a <- adonis(SNI_dist.noNA ~ sex + condition + month_collected + weight, data=metadata.SNI.noNA, permutations = 99999)
+
+SNI.mod4a <- adonis(SNI_dist.noNA ~ sex + condition + month_collected, data=metadata.SNI.noNA, permutations = 99999)
+
+SNI.mod5a <- adonis(SNI_dist.noNA ~ sex + month_collected, data=metadata.SNI.noNA, permutations = 99999)
+
+SNI.mod6a <- adonis(SNI_dist.noNA ~  sex, data=metadata.SNI.noNA, permutations = 99999)
+
+
+# Run the model test function on all the model outputs
+SNI.mod0 <-modTest(SNI.mod0a)
+SNI.mod1 <-modTest(SNI.mod1a)
+SNI.mod2 <-modTest(SNI.mod2a)
+SNI.mod3 <-modTest(SNI.mod3a)
+SNI.mod4 <-modTest(SNI.mod4a)
+SNI.mod5 <-modTest(SNI.mod5a)
+SNI.mod6 <-modTest(SNI.mod6a)
+
+SNI.mod.all <- rbind(SNI.mod0, SNI.mod1, SNI.mod2, SNI.mod3, SNI.mod4, SNI.mod5, SNI.mod6)
+
+
+SNI.kable <- kable(SNI.mod.all %>% rownames_to_column('var') %>% arrange(AIC, P) %>% column_to_rownames('var'), caption = "SNI PERMANOVA and model testing results sorted by AIC") %>% kable_styling(fixed_thead = T) %>%
+  #column_specSNI.mod.all$(8, color=spec_color(AIC, end=0.7)) %>%
+  pack_rows("SNI_dist.noNA ~ sex + month_collected + condition + age + weight + extracted.group", 1, 8) %>%
+  pack_rows("SNI_dist.noNA ~ sex", 9, 11) %>%
+  pack_rows("SNI_dist.noNA ~ sex + month_collected", 12, 15) %>%
+  pack_rows("SNI_dist.noNA ~ sex + month_collected + condition + age + weight", 16, 22) %>%
+  pack_rows("SNI_dist.noNA ~ sex + month_collected + condition", 23, 27) %>%
+  pack_rows("SNI_dist.noNA ~ sex + month_collected + condition + weight", 28, 33) %>%
+  pack_rows("SNI_dist.noNA ~ condition", 34,36)
+
+SNI.kable
+
+```
+
+&nbsp;
+
+#### PCoA - SNI
+```{r, warning=FALSE, message=FALSE}
+# PCOA
+SNI_count_phy <- otu_table(SNI_trans_count_tab, taxa_are_rows=T)
+SNI_sample_info_phy <- sample_data(SNI.noRep.noNA)
+SNI_physeq <- phyloseq(SNI_count_phy, SNI_sample_info_phy)
+#SNI_pcoa_euc <- ordinate(SNI_physeq, method="MDS", distance="euclidean")
+SNI_pcoa_euc <- ordinate(SNI_physeq, method="MDS", distance="bray")
+SNI_eigen_vals <- SNI_pcoa_euc$values$Eigenvalues
+
+SNI.pcoa.pxx2 <- plot_ordination(SNI_physeq, SNI_pcoa_euc, shape="sex") + 
+  geom_point(size=7, color= "coral2", fill="coral2") + 
+    coord_fixed(sqrt(SNI_eigen_vals[2]/SNI_eigen_vals[1])) + ggtitle("SNI") + 
+    scale_shape_manual(values = c(16, 79)) +
+  theme_bw() + theme(text = element_text(size=15)) + labs(shape="sex")
+SNI.pcoa.pxx2$layers <- SNI.pcoa.pxx2$layers[-1] # remove double plotting 
+
+SNI.pcoa.pxx2
+```
+
+&nbsp;
+
+#### Differential abundance - SNI (based on one male)
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+## diff abundance
+SNI_deseqx <- phyloseq_to_deseq2(SNI.noRep.noNA, ~ sex)
+SNI_deseqx2 <- estimateSizeFactors(SNI_deseqx, type="poscounts")
+SNI_deseq3 <- DESeq(SNI_deseqx2)
+SNI_deseq_res <- results(SNI_deseq3, alpha=0.01, contrast= c("sex", "F", "M"))  
+SNI_sigtab_res_deseq <- SNI_deseq_res[which(SNI_deseq_res$padj < 0.01), ] 
+SNI.sum <- summary(SNI_sigtab_res_deseq)
+
+
+SNI_sigtab_deseq_with_tax <- cbind(as(SNI_sigtab_res_deseq, "data.frame"), as(tax_table(SNI.noRep.noNA)[row.names(SNI_sigtab_res_deseq), ], "matrix"))
+
+SNI.sig.tax <- SNI_sigtab_deseq_with_tax[order(SNI_sigtab_deseq_with_tax$log2FoldChange, decreasing=T), ]
+
+kable(SNI.sig.tax[1:10,1:10], caption = "Top 10 signif diff abundant taxa - SNI ~ sex")  %>% kable_styling()
+
+```
+
+&nbsp;
+
+#### Multivariate analyses, SNI (Females only)
+Since there was only 1 male, I removed it to do multivariate analyses on the females.
+```{r, warning=FALSE, message=FALSE}
+# Make dataset
+SNI.noRep <- subset_samples(ASVs.B1.noRep, source == "SNI") # N=14
+
+metadata.SNI <- subset(metadata.decont.deRep, subset= source == "SNI")
+metadata.SNI.noNA <- metadata.SNI[complete.cases(metadata.SNI),] # N=10
+SNI.diff <- setdiff(metadata.SNI$id, metadata.SNI.noNA$id)
+SNI.noRep.noNA <- subset_samples(SNI.noRep, id_merge != "SNI.10A" & id_merge != "SNI.17" & id_merge != "SNI.20" & id_merge != "SNI.2B") # N=10
+SNI.noRep.noNA.F <- subset_samples(SNI.noRep.noNA, sex == "F") # N=9
+metadata.SNI.noNA.F <- metadata.SNI.noNA %>% filter(sex == "F") # N=9
+
+SNI_deseq.F <- phyloseq_to_deseq2(SNI.noRep.noNA.F, ~ age)
+SNI_deseq2.F <- estimateSizeFactors(SNI_deseq.F, type="poscounts") #poscounts fixes the issues with zero counts
+SNI_vst.F <- varianceStabilizingTransformation(SNI_deseq2.F)
+SNI_trans_count_tab.F <- assay(SNI_vst.F)
+SNI_trans_count_tab.F[SNI_trans_count_tab.F < 0] <- 0
+SNI_dist.noNA.F <- t(SNI_trans_count_tab.F)
+#SNI_dist.noNA.F <- vegdist(SNI_dist.noNA.F, method="euclidean", diag = TRUE)
+SNI_dist.noNA.F <- vegdist(SNI_dist.noNA.F, method="bray", diag = TRUE)
+
+# PCOA
+SNI_count_phy.F <- otu_table(SNI_trans_count_tab.F, taxa_are_rows=T)
+SNI_sample_info_phy.F <- sample_data(SNI.noRep.noNA.F)
+SNI_physeq.F <- phyloseq(SNI_count_phy.F, SNI_sample_info_phy.F)
+#SNI_pcoa_euc.F <- ordinate(SNI_physeq.F, method="MDS", distance="euclidean")
+SNI_pcoa_euc.F <- ordinate(SNI_physeq.F, method="MDS", distance="bray")
+SNI_eigen_vals.F <- SNI_pcoa_euc.F$values$Eigenvalues
+
+SNI.pcoa.p.F <- plot_ordination(SNI_physeq.F, SNI_pcoa_euc.F, color="month_collected") + 
+  #labs(col="sex") +
+  geom_point(size=7) + 
+    coord_fixed(sqrt(SNI_eigen_vals[2]/SNI_eigen_vals[1])) + ggtitle("SNI PCoA, Bray-Curtis") + 
+  #scale_color_manual(values = cols)  + #stat_ellipse() +
+  scale_color_viridis(discrete=TRUE, end = 0.7) +
+  theme_bw() + theme(text = element_text(size=15))
+
+
+#### Test for homogeneity - SNI (F only)
+SNI.gen2.F <- geneity2(SNI_dist.noNA.F, metadata.SNI.noNA.F$condition, "condition")
+SNI.gen3.F <- geneity2(SNI_dist.noNA.F, metadata.SNI.noNA.F$age, "age")
+#SNI.gen4.F <- geneity2(SNI_dist.noNA.F, metadata.SNI.noNA.F$year_collected, "yearCollected")
+SNI.gen5.F <- geneity2(SNI_dist.noNA.F, metadata.SNI.noNA.F$month_collected, "monthCollected")
+SNI.gen6.F <- geneity2(SNI_dist.noNA.F, metadata.SNI.noNA.F$weight, "weight")
+SNI.gen7.F <- geneity2(SNI_dist.noNA.F, metadata.SNI.noNA.F$extracted.group, "extractGrp")
+
+SNI.gen.all.F <- as.data.frame(rbind(SNI.gen2.F, SNI.gen3.F, SNI.gen5.F, SNI.gen6.F, SNI.gen7.F))
+
+
+#kable(SNI.gen.all.F %>% rownames_to_column('var') %>% arrange(desc(P)) %>% column_to_rownames('var') , caption = "Test for homogeneity (betadisper) per variable - SNI Females")  %>% kable_styling() 
+
+# Condition is the only variable that has homogenous dispersion.
+
+#### Model testing with AICc - SNI (F only)
+# Test variables that passed the test for homogeneity
+SNI.mod0a.F <- adonis(SNI_dist.noNA.F ~ condition, data=metadata.SNI.noNA.F, permutations = 99999)
+
+# Model testing by sequentially removed variables with low variance explained (R2)
+SNI.mod1a.F <- adonis(SNI_dist.noNA.F ~ condition + age + month_collected + weight + extracted.group, data=metadata.SNI.noNA.F, permutations = 99999)
+
+SNI.mod2a.F <- adonis(SNI_dist.noNA.F ~ condition + age + month_collected + weight, data=metadata.SNI.noNA.F, permutations = 99999)
+
+SNI.mod3a.F <- adonis(SNI_dist.noNA.F ~ condition + month_collected + weight, data=metadata.SNI.noNA.F, permutations = 99999)
+
+SNI.mod4a.F <- adonis(SNI_dist.noNA.F ~ condition + month_collected, data=metadata.SNI.noNA.F, permutations = 99999)
+
+SNI.mod5a.F <- adonis(SNI_dist.noNA.F ~ month_collected, data=metadata.SNI.noNA.F, permutations = 99999)
+
+
+# Run the model test function on all the model outputs
+SNI.mod0.F <-modTest(SNI.mod0a.F)
+SNI.mod1.F <-modTest(SNI.mod1a.F)
+SNI.mod2.F <-modTest(SNI.mod2a.F)
+SNI.mod3.F <-modTest(SNI.mod3a.F)
+SNI.mod4.F <-modTest(SNI.mod4a.F)
+SNI.mod5.F <-modTest(SNI.mod5a.F)
+
+
+SNI.mod.all.F <- rbind(SNI.mod0.F, SNI.mod1.F, SNI.mod2.F, SNI.mod3.F, SNI.mod4.F, SNI.mod5.F)
+
+# The best model includes on month collected, but the term is not significant.
+
+kable(SNI.mod.all.F %>% rownames_to_column('var') %>% arrange(AIC, P) %>% column_to_rownames('var'), caption = "SNI Females PERMANOVA and model testing results sorted by AIC") %>% kable_styling(fixed_thead = T) %>%
+  #column_specSNI.mod.all$(8, color=spec_color(AIC, end=0.7)) %>%
+  pack_rows("SNI_dist.noNA.F ~ month_collected", 1, 3) %>%
+  pack_rows("SNI_dist.noNA.F ~ month_collected + condition + age + weight + extracted.group", 4, 10) %>%
+  pack_rows("SNI_dist.noNA.F ~ condition", 11, 13) %>%
+  pack_rows("SNI_dist.noNA.F ~ month_collected + condition", 14, 17) %>%
+  pack_rows("SNI_dist.noNA.F ~ month_collected + condition + age + weight", 18, 23) %>%
+  pack_rows("SNI_dist.noNA.F ~ month_collected + condition + weight", 24, 28) 
+
+
+```
+
+&nbsp;
+
+#### Differential abundance - SNI ~ sex (one male) - GENUS level
+https://github.com/joey711/phyloseq/issues/683#issuecomment-269682100
+```{r, warning=FALSE, message=FALSE}
+## filter phyloseq obj to genus level
+#GenusFiltered <- subset_taxa(SNI.noRep.noNA, !is.na(Genus) & is.na(Species))
+SNI_GenusFiltered <- subset_taxa(SNI.noRep.noNA, Genus != "g__" & Species == "s__")
+SNI_physeqGenus = tax_glom(SNI_GenusFiltered, "Genus")
+
+## diff abundance
+SNI_deseqx_g <- phyloseq_to_deseq2(SNI_physeqGenus, ~ sex)
+SNI_deseqx2_g <- estimateSizeFactors(SNI_deseqx_g, type="poscounts")
+SNI_deseq3_g <- DESeq(SNI_deseqx2_g)
+SNI_deseq_res_g <- results(SNI_deseq3_g, alpha=0.01, contrast= c("sex", "F", "M"))  
+SNI_sigtab_res_deseq_g <- SNI_deseq_res_g[which(SNI_deseq_res_g$padj < 0.01), ] 
+SNI.sum_g <- summary(SNI_sigtab_res_deseq_g)
+
+
+SNI_sigtab_deseq_with_tax_g <- cbind(as(SNI_sigtab_res_deseq_g, "data.frame"), as(tax_table(SNI_physeqGenus)[row.names(SNI_sigtab_res_deseq_g), ], "matrix"))
+
+SNI.sig.tax_g <- SNI_sigtab_deseq_with_tax_g[order(SNI_sigtab_deseq_with_tax_g$log2FoldChange, decreasing=T), ]
+SNI.sig.taxR_g <- SNI_sigtab_deseq_with_tax_g[order(SNI_sigtab_deseq_with_tax_g$log2FoldChange, decreasing=F), ]
+
+SNI.sig.tax.all_g <- rbind(SNI.sig.tax_g[1:5,])
+
+kable(SNI.sig.tax.all_g, caption = "Top signif diff abundant GENERA - SNI ~ sex")  %>% kable_styling() %>%
+  pack_rows("More abundant in Females", 1, 5) # %>%
+ # pack_rows("More abundant in Males", 6,6 ) 
+
+```
+
+&nbsp;
+&nbsp;
+
+#### Combine signif PCoAs for islands
+```{r, warning=FALSE, message=FALSE}
+
+isl.pca.all <- cowplot::plot_grid(SRI.pcoa.pxx2, CAT.pcoa.pxx2, SCL.pcoa.pxx2, SNI.pcoa.pxx2, labels = "AUTO")
+
+# jpeg(filename="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/ms_drafts/FrontiersInMicro_6-26-2021/FigS3_islPCoAs.jpg", units="in", width=11, height=8, res=300)
+# isl.pca.all
+# dev.off()
+
+```
+
+
+&nbsp;
+&nbsp;
+&nbsp;
+
+## Wild vs Captive
+Two zoo samples (SBZ 3/4 and OCZ 1/2) were born in captivity but are descended from San Clemente Island foxes.  One zoo sample (SBZ 1/2) was born on San Clemente Island but was brought into captivity.
+
+&nbsp;
+
+#### Define dataset - wild v captive
+```{r, warning=FALSE, message=FALSE}
+# Data wrangling
+W.C.noRep <- subset_samples(ASVs.B1.noRep, source == "SCL" | source == "OCZ" | source == "SBZ")
+metadata.W.C <- subset(metadata.decont.deRep, subset= source == "SCL"| source == "OCZ" | source == "SBZ")
+metadata.W.C <- metadata.W.C %>% select(-condition, -weight, -extracted.group) # remove bc missing data
+
+# add born in zoo vs island factor
+W.C.noRep@sam_data$born <- ifelse(W.C.noRep@sam_data$source == "SCL", "wild", "zoo")
+W.C.noRep@sam_data$born[W.C.noRep@sam_data$id_merge == 'SBZ.1'] <- 'wild' # zoo names pretty-fied
+
+metadata.W.C$born <- ifelse(metadata.W.C$source == "SCL"|metadata.W.C$id_merge == "SBZOO.1", "wild", "zoo") # zoo names not pretty-fied
+ 
+W.C_deseq <- phyloseq_to_deseq2(W.C.noRep, ~wild_captive)
+W.C_deseq2 <- estimateSizeFactors(W.C_deseq, type="poscounts") #poscounts fixes the issues with zero counts
+W.C_vst <- varianceStabilizingTransformation(W.C_deseq2)
+W.C_trans_count_tab <- assay(W.C_vst)
+W.C_trans_count_tab[W.C_trans_count_tab < 0] <- 0
+#euc_dist.W.C <- vegdist(t(W.C_trans_count_tab), method = "euclidean", diag = TRUE)
+#euc_dist.W.C <- vegdist(SNI_dist.noNA, method="euclidean", diag = TRUE)
+euc_dist.W.C <- vegdist(t(W.C_trans_count_tab), method = "bray", diag = TRUE)
+
+```
+
+&nbsp;
+
+#### PCoA - wild v captive
+```{r, warning=FALSE, message=FALSE}
+# PCOA
+W.C_count_phy <- otu_table(W.C_trans_count_tab, taxa_are_rows=T)
+W.C_sample_info_phy <- sample_data(W.C.noRep)
+W.C_physeq <- phyloseq(W.C_count_phy, W.C_sample_info_phy)
+#W.C_pcoa_euc <- ordinate(W.C_physeq, method="MDS", distance="euclidean")
+W.C_pcoa_euc <- ordinate(W.C_physeq, method="MDS", distance="bray")
+W.C_eigen_vals <- W.C_pcoa_euc$values$Eigenvalues
+
+W.C_physeq@sam_data$cap <- ifelse(W.C_physeq@sam_data$wild_captive == "captive", W.C_physeq@sam_data$id_merge, "")
+
+W.C_physeq@sam_data$source <- factor(W.C_physeq@sam_data$source, levels = c("SCL","SBZ", "OCZ"))
+
+W.C.pcoa.pxx2 <- plot_ordination(W.C_physeq, W.C_pcoa_euc, color="source", shape="source") + 
+  labs(col="source", shape="source") + geom_point(size=7, alpha=0.88) +
+  #geom_text_repel(aes(label=cap), nudge_y=15, nudge_x=6, show.legend = F) +
+  geom_text_repel(aes(label=cap), nudge_y=0.082, nudge_x=0.03, show.legend = F) +
+    coord_fixed(sqrt(W.C_eigen_vals[2]/W.C_eigen_vals[1])) + ggtitle("") + #W.C PCoA, Euc dist
+  scale_color_manual(values = cols[c("SCL", "SBZ", "OCZ")])  + #stat_ellipse() +
+  #scale_color_manual(values = v_colors[c(5,7,8)])+
+  scale_shape_manual(values=c(16, 15, 15)) +
+  theme_bw() + theme(text = element_text(size=15))
+  W.C.pcoa.pxx2$layers <- W.C.pcoa.pxx2$layers[-1]
+
+ W.C.pcoa.pxx2
+```
+
+&nbsp;
+
+### Dispersion from centroid - wild v captive
+```{r, warning=FALSE, message=FALSE}
+# Dispersion from centroid
+W.C_mod <- betadisper(euc_dist.W.C, W.C.noRep@sam_data$source)
+W.C_mod2 <- as.data.frame(W.C_mod$distances)
+W.C_mod2$id <- rownames(W.C_mod2)
+names(W.C_mod2)[names(W.C_mod2) == "W.C_mod$distances"] <- "distance"
+W.C_mod.source <- as.data.frame(W.C_mod$group)
+W.C_mod2$source <- W.C_mod.source$`W.C_mod$group`
+W.C_mod2$source <- factor(W.C_mod2$source, levels = c("SCL","SBZ", "OCZ"))
+W.C_mod2$cap <- ifelse(W.C_mod2$source == "OCZ" |W.C_mod2$source == "SBZ", W.C_mod2$id, "")
+
+WC.box2 <- ggplot(W.C_mod2, aes( source, distance, color=factor(source))) +
+  geom_boxplot(aes(color=factor(source), alpha = 0.5), show.legend = FALSE, outlier.shape = NA) +
+  geom_jitter(aes(color=factor(source)), size=2, width=0.15, height=0, show.legend = FALSE) +
+  scale_color_manual(values=cols) +
+  #scale_color_manual(values = v_colors[c(5,7,8)]) +
+  geom_text_repel(aes(label=cap)) +
+  labs(x="", y="Bray-Curtis\n Distance to centroid") +
+  theme_bw() + theme(text = element_text(size=15), legend.position = "none") 
+  #stat_compare_means(aes(group=source))
+
+second.row2 <- cowplot::plot_grid(WC.box2, labels = "B", ncol = 2)
+first.row2 <- cowplot::plot_grid(W.C.pcoa.pxx2, labels = "A", ncol = 2)
+cap.p <- cowplot::plot_grid(W.C.pcoa.pxx2, second.row2, labels = "AUTO", nrow=2)
+#ggsave(plot = cap.p, height = 7.5, width = 10.5, filename = "/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/ms_drafts/FrontiersInMicro_2-8-20/Fig5_cap.png")
+
+
+WC.box2
+
+```
+
+&nbsp;
+
+### Test for homogeneity - wild v captive
+```{r,  warning=FALSE, message=FALSE}
+WC.gen0 <- geneity2(euc_dist.W.C, metadata.W.C$source, "source")
+WC.gen00 <- geneity2(euc_dist.W.C, metadata.W.C$wild_captive, "wc")
+WC.gen000 <- geneity2(euc_dist.W.C, metadata.W.C$born, "born")
+WC.gen1 <- geneity2(euc_dist.W.C, metadata.W.C$sex, "sex")
+#WC.gen2 <- geneity2(euc_dist.W.C, metadata.W.C$condition, "condition")
+WC.gen3 <- geneity2(euc_dist.W.C, metadata.W.C$age, "age")
+WC.gen4 <- geneity2(euc_dist.W.C, metadata.W.C$year_collected, "yearCollected")
+WC.gen5 <- geneity2(euc_dist.W.C, metadata.W.C$month_collected, "monthCollected")
+#WC.gen6 <- geneity2(euc_dist.W.C, metadata.W.C$weight, "weight")
+#WC.gen7 <- geneity2(euc_dist.W.C, metadata.W.C$extracted.group, "extractGrp")
+
+WC.gen.all <- as.data.frame(rbind(WC.gen0,WC.gen00, WC.gen000, WC.gen1, WC.gen3, WC.gen4, WC.gen5))
+
+
+kable(WC.gen.all %>% rownames_to_column('var') %>% arrange(desc(P)) %>% column_to_rownames('var') , caption = "Test for homogeneity (betadisper) per variable - WC")  %>% kable_styling() 
+
+```
+
+&nbsp;
+
+### Model testing - wild v captive
+```{r, warning=FALSE, message=FALSE}
+WC.mod0a <- adonis(euc_dist.W.C ~ sex, data=metadata.W.C, permutations = 99999)
+
+# Model testing by sequentially removed variables with low variance explained (R2)
+WC.mod1a <- adonis(euc_dist.W.C ~ wild_captive + born + sex + age + year_collected + month_collected + source, data=metadata.W.C, permutations = 99999)
+
+WC.mod2a <- adonis(euc_dist.W.C ~ wild_captive + sex + age + year_collected + month_collected, data=metadata.W.C, permutations = 99999)
+
+WC.mod2.5a <- adonis(euc_dist.W.C ~ wild_captive + sex + year_collected + month_collected, data=metadata.W.C, permutations = 99999)
+
+WC.mod3a <- adonis(euc_dist.W.C ~ wild_captive + year_collected + month_collected, data=metadata.W.C, permutations = 99999)
+
+WC.mod4a <- adonis(euc_dist.W.C ~ wild_captive + month_collected , data=metadata.W.C, permutations = 99999)
+
+#WC.mod5a <- adonis(euc_dist.W.C ~ wild_captive + month_collected, data=metadata.W.C, permutations = 99999)
+
+WC.mod6a <- adonis(euc_dist.W.C ~ wild_captive, data=metadata.W.C, permutations = 99999)
+
+#WC.mod7a <- adonis(euc_dist.W.C ~ source, data=metadata.W.C, permutations = 99999)
+
+
+# Run the model test function on all the model outputs
+WC.mod0 <-modTest(WC.mod0a)
+WC.mod1 <-modTest(WC.mod1a)
+WC.mod2 <-modTest(WC.mod2a)
+WC.mod2.5 <-modTest(WC.mod2.5a)
+WC.mod3 <-modTest(WC.mod3a)
+WC.mod4 <-modTest(WC.mod4a)
+#WC.mod5 <-modTest(WC.mod5a)
+WC.mod6 <-modTest(WC.mod6a)
+#WC.mod7 <-modTest(WC.mod7a)
+
+
+WC.mod.all <- rbind(WC.mod0, WC.mod1, WC.mod2, WC.mod2.5, WC.mod3, WC.mod4, WC.mod6)
+
+# kable(WC.mod.all %>% rownames_to_column('var') %>% arrange(AIC, P) %>% column_to_rownames('var'), caption = "Wild v Captive PERMANOVA and model testing results sorted by AIC") %>% kable_styling(fixed_thead = T) %>%
+#   #column_specSNI.mod.all$(8, color=spec_color(AIC, end=0.7)) %>%
+#   pack_rows("euc_dist.W.C ~ wild_captive", 1, 3) %>%
+#   pack_rows("euc_dist.W.C ~ wild_captive + month_collected", 4, 7) %>%
+#   pack_rows("euc_dist.W.C ~ wild_captive + month_collected + year_collected", 8, 12) %>%
+#   pack_rows("euc_dist.W.C ~ sex", 13, 15) %>%
+#   pack_rows("euc_dist.W.C ~ wild_captive + month_collected + year_collected + sex", 16, 21) %>%
+#   pack_rows("euc_dist.W.C ~ wild_captive + month_collected + year_collected + sex + age", 22, 28)  %>%
+#   pack_rows("euc_dist.W.C ~ wild_captive + month_collected + year_collected + sex + age + born", 29, 36)
+
+wc.kable <- kable(WC.mod.all %>% rownames_to_column('var') %>% arrange(AIC, P) %>% column_to_rownames('var'), caption = "Wild v Captive PERMANOVA and model testing results sorted by AIC") %>% kable_styling(fixed_thead = T) %>%
+  #column_specSNI.mod.all$(8, color=spec_color(AIC, end=0.7)) %>%
+  pack_rows("euc_dist.W.C ~ wild_captive + month_collected + year_collected", 1, 5) %>%
+   pack_rows("euc_dist.W.C ~ wild_captive + month_collected", 6, 9) %>%
+   pack_rows("euc_dist.W.C ~ wild_captive + month_collected + year_collected + sex", 10, 15) %>%
+   pack_rows("euc_dist.W.C ~ wild_captive + month_collected + year_collected + sex + age", 16, 22)  %>%
+   pack_rows("euc_dist.W.C ~ wild_captive + month_collected + year_collected + sex + age + born", 23, 30) %>%
+   pack_rows("euc_dist.W.C ~ wild_captive", 31, 33) %>%
+   pack_rows("euc_dist.W.C ~ sex", 34, 36) 
+ 
+wc.kable  
+  
+```
+
+&nbsp;
+
+### Differential abundance - wild v captive
+```{r, warning=FALSE, message=FALSE}
+# wild v captive
+## diff abundance
+cap_deseq <- phyloseq_to_deseq2(W.C.noRep, ~wild_captive) # changed from ASVs.B1.noRep 
+cap_deseq2 <- estimateSizeFactors(cap_deseq, type="poscounts")
+cap_deseq3 <- DESeq(cap_deseq2)
+deseq_res_cap <- results(cap_deseq3, alpha=0.01, contrast= c("wild_captive", "wild", "captive")) # 
+sigtab_res_deseq_cap <- deseq_res_cap[which(deseq_res_cap$padj < 0.01), ] 
+wc.sum <- summary(sigtab_res_deseq_cap)
+
+
+sigtab_deseq_cap_with_tax <- cbind(as(sigtab_res_deseq_cap, "data.frame"), as(tax_table(W.C.noRep)[row.names(sigtab_res_deseq_cap), ], "matrix"))
+
+wc.sig.tax <- sigtab_deseq_cap_with_tax[order(sigtab_deseq_cap_with_tax$log2FoldChange, decreasing=T), ] #181
+wc.sig.tax.R <- sigtab_deseq_cap_with_tax[order(sigtab_deseq_cap_with_tax$log2FoldChange, decreasing=F), ]
+wc.sig.tax.all <- rbind(wc.sig.tax[1:3,], wc.sig.tax.R[1:3,])
+
+#kable(wc.sig.tax[1:10,1:10], caption = "Top 10 signif diff abundant taxa - wild v captive")  %>% kable_styling()
+
+kable(wc.sig.tax.all, caption = "Top signif diff abundant taxa - wild v captive")  %>% kable_styling() %>%
+  pack_rows("More abundant in wild", 1, 3) %>%
+  pack_rows("More abundant in captive", 4, 6)
+
+```
+
+&nbsp;
+
+#### Differential abundance - Wild v captive - GENUS level
+https://github.com/joey711/phyloseq/issues/683#issuecomment-269682100
+```{r, warning=FALSE, message=FALSE}
+## filter phyloseq obj to genus level
+#GenusFiltered <- subset_taxa(WC.noRep.noNA, !is.na(Genus) & is.na(Species))
+WC_GenusFiltered <- subset_taxa(W.C.noRep, Genus != "g__" & Species == "s__")
+WC_physeqGenus = tax_glom(WC_GenusFiltered, "Genus")
+
+## diff abundance
+WC_deseqx_g <- phyloseq_to_deseq2(WC_physeqGenus, ~ wild_captive)
+WC_deseqx2_g <- estimateSizeFactors(WC_deseqx_g, type="poscounts")
+WC_deseq3_g <- DESeq(WC_deseqx2_g)
+WC_deseq_res_g <- results(WC_deseq3_g, alpha=0.01, contrast= c("wild_captive", "wild", "captive"))  
+WC_sigtab_res_deseq_g <- WC_deseq_res_g[which(WC_deseq_res_g$padj < 0.01), ] 
+WC.sum_g <- summary(WC_sigtab_res_deseq_g)
+
+
+WC_sigtab_deseq_with_tax_g <- cbind(as(WC_sigtab_res_deseq_g, "data.frame"), as(tax_table(WC_physeqGenus)[row.names(WC_sigtab_res_deseq_g), ], "matrix"))
+
+WC.sig.tax_g <- WC_sigtab_deseq_with_tax_g[order(WC_sigtab_deseq_with_tax_g$log2FoldChange, decreasing=T), ]
+WC.sig.taxR_g <- WC_sigtab_deseq_with_tax_g[order(WC_sigtab_deseq_with_tax_g$log2FoldChange, decreasing=F), ]
+
+WC.sig.tax.all_g <- rbind(WC.sig.tax_g[1:5,], WC.sig.taxR_g[1:1,])
+
+kable(WC.sig.tax.all_g, caption = "Top signif diff abundant GENERA - WC ~ wild v captive")  %>% kable_styling() %>%
+  pack_rows("More abundant in wild", 1, 5)  %>%
+  pack_rows("More abundant in captive", 6,6 ) 
+
+```
+
+
+&nbsp;
+
+### Differential abundance - wild v captive ~ year
+```{r, warning=FALSE, message=FALSE}
+# yr
+## diff abundance
+cap_deseq_yr <- phyloseq_to_deseq2(W.C.noRep, ~year_collected) # changed from ASVs.B1.noRep 
+cap_deseq2_yr <- estimateSizeFactors(cap_deseq_yr, type="poscounts")
+cap_deseq3_yr <- DESeq(cap_deseq2_yr)
+deseq_res_cap_yr <- results(cap_deseq3_yr, alpha=0.01, contrast= c("year_collected", "2014", "2015")) # 
+sigtab_res_deseq_cap_yr <- deseq_res_cap_yr[which(deseq_res_cap_yr$padj < 0.01), ] 
+wc.sum_yr <- summary(sigtab_res_deseq_cap_yr)
+
+
+sigtab_deseq_cap_with_tax_yr <- cbind(as(sigtab_res_deseq_cap_yr, "data.frame"), as(tax_table(W.C.noRep)[row.names(sigtab_res_deseq_cap_yr), ], "matrix"))
+
+wc.sig.tax_yr <- sigtab_deseq_cap_with_tax_yr[order(sigtab_deseq_cap_with_tax_yr$log2FoldChange, decreasing=T), ] #181
+wc.sig.tax.R_yr <- sigtab_deseq_cap_with_tax_yr[order(sigtab_deseq_cap_with_tax_yr$log2FoldChange, decreasing=F), ]
+wc.sig.tax.all_yr <- rbind(wc.sig.tax_yr[1:3,], wc.sig.tax.R_yr[1:3,])
+
+#kable(wc.sig.tax[1:10,1:10], caption = "Top 10 signif diff abundant taxa - wild v captive")  %>% kable_styling()
+
+kable(wc.sig.tax.all_yr, caption = "Top signif diff abundant taxa - wild v captive ~ 2014 v 2015")  %>% kable_styling() %>%
+  pack_rows("More abundant in 2014", 1, 3) %>%
+  pack_rows("More abundant in 2015", 4, 6)
+
+```
+
+&nbsp;
+
+#### Differential abundance - Wild v captive ~ year - GENUS level
+https://github.com/joey711/phyloseq/issues/683#issuecomment-269682100
+```{r, warning=FALSE, message=FALSE}
+## filter phyloseq obj to genus level
+#GenusFiltered <- subset_taxa(WC.noRep.noNA, !is.na(Genus) & is.na(Species))
+#WC_GenusFiltered <- subset_taxa(W.C.noRep, Genus != "g__" & Species == "s__")
+#WC_physeqGenus = tax_glom(WC_GenusFiltered, "Genus")
+
+## diff abundance
+WC_deseqx_gyr <- phyloseq_to_deseq2(WC_physeqGenus, ~ year_collected)
+WC_deseqx2_gyr <- estimateSizeFactors(WC_deseqx_gyr, type="poscounts")
+WC_deseq3_gyr <- DESeq(WC_deseqx2_gyr)
+WC_deseq_res_gyr <- results(WC_deseq3_gyr, alpha=0.01, contrast= c("year_collected", "2014", "2015"))  
+WC_sigtab_res_deseq_gyr <- WC_deseq_res_gyr[which(WC_deseq_res_gyr$padj < 0.01), ] 
+WC.sum_gyr <- summary(WC_sigtab_res_deseq_gyr)
+
+
+WC_sigtab_deseq_with_tax_gyr <- cbind(as(WC_sigtab_res_deseq_gyr, "data.frame"), as(tax_table(WC_physeqGenus)[row.names(WC_sigtab_res_deseq_gyr), ], "matrix"))
+
+WC.sig.tax_gyr <- WC_sigtab_deseq_with_tax_gyr[order(WC_sigtab_deseq_with_tax_gyr$log2FoldChange, decreasing=T), ]
+WC.sig.taxR_gyr <- WC_sigtab_deseq_with_tax_gyr[order(WC_sigtab_deseq_with_tax_gyr$log2FoldChange, decreasing=F), ]
+
+WC.sig.tax.all_gyr <- rbind(WC.sig.tax_gyr[1:3,], WC.sig.taxR_gyr[1:1,])
+
+kable(WC.sig.tax.all_gyr, caption = "Top signif diff abundant GENERA - WC ~ wild v captive")  %>% kable_styling() %>%
+  pack_rows("More abundant in 2014", 1, 3)  %>%
+  pack_rows("More abundant in 2015", 4,4 ) 
+
+```
+
+&nbsp;
+
+### Differential abundance - wild v captive ~ month
+```{r, warning=FALSE, message=FALSE}
+# month
+## convert month abbreviated names to numeric
+W.C.noRep@sam_data$month_collected.n <- match(W.C.noRep@sam_data$month_collected,month.abb)
+## diff abundance
+cap_deseq_mo <- phyloseq_to_deseq2(W.C.noRep, ~month_collected.n) # changed from ASVs.B1.noRep 
+cap_deseq2_mo <- estimateSizeFactors(cap_deseq_mo, type="poscounts")
+cap_deseq3_mo <- DESeq(cap_deseq2_mo)
+deseq_res_cap_mo <- results(cap_deseq3_mo, alpha=0.01, name= "month_collected.n") # 
+sigtab_res_deseq_cap_mo <- deseq_res_cap_mo[which(deseq_res_cap_mo$padj < 0.01), ] 
+wc.sum_mo <- summary(sigtab_res_deseq_cap_mo)
+
+
+sigtab_deseq_cap_with_tax_mo <- cbind(as(sigtab_res_deseq_cap_mo, "data.frame"), as(tax_table(W.C.noRep)[row.names(sigtab_res_deseq_cap_mo), ], "matrix"))
+
+wc.sig.tax_mo <- sigtab_deseq_cap_with_tax_mo[order(sigtab_deseq_cap_with_tax_mo$log2FoldChange, decreasing=T), ] #181
+wc.sig.tax.R_mo <- sigtab_deseq_cap_with_tax_mo[order(sigtab_deseq_cap_with_tax_mo$log2FoldChange, decreasing=F), ]
+wc.sig.tax.all_mo <- rbind(wc.sig.tax_mo[1:3,], wc.sig.tax.R_mo[1:3,])
+
+#kable(wc.sig.tax[1:10,1:10], caption = "Top 10 signif diff abundant taxa - wild v captive")  %>% kable_styling()
+
+kable(wc.sig.tax.all_mo, caption = "Top signif diff abundant taxa - wild v captive ~ months")  %>% kable_styling() %>%
+  pack_rows("More abundant in earlier months", 1, 3) %>%
+  pack_rows("More abundant in later months", 4, 6)
+
+```
+
+&nbsp;
+
+#### Differential abundance - Wild v captive ~ month - GENUS level
+https://github.com/joey711/phyloseq/issues/683#issuecomment-269682100
+```{r, warning=FALSE, message=FALSE}
+## filter phyloseq obj to genus level
+#GenusFiltered <- subset_taxa(WC.noRep.noNA, !is.na(Genus) & is.na(Species))
+#WC_GenusFiltered <- subset_taxa(W.C.noRep, Genus != "g__" & Species == "s__")
+#WC_physeqGenus = tax_glom(WC_GenusFiltered, "Genus")
+
+## diff abundance
+WC_deseqx_gmo <- phyloseq_to_deseq2(WC_physeqGenus, ~ month_collected.n)
+WC_deseqx2_gmo <- estimateSizeFactors(WC_deseqx_gmo, type="poscounts")
+WC_deseq3_gmo <- DESeq(WC_deseqx2_gmo)
+WC_deseq_res_gmo <- results(WC_deseq3_gmo, alpha=0.01, name= "month_collected.n")  
+WC_sigtab_res_deseq_gmo <- WC_deseq_res_gmo[which(WC_deseq_res_gmo$padj < 0.01), ] 
+WC.sum_gmo <- summary(WC_sigtab_res_deseq_gmo)
+
+
+WC_sigtab_deseq_with_tax_gmo <- cbind(as(WC_sigtab_res_deseq_gmo, "data.frame"), as(tax_table(WC_physeqGenus)[row.names(WC_sigtab_res_deseq_gmo), ], "matrix"))
+
+WC.sig.tax_gmo <- WC_sigtab_deseq_with_tax_gmo[order(WC_sigtab_deseq_with_tax_gmo$log2FoldChange, decreasing=T), ]
+WC.sig.taxR_gmo <- WC_sigtab_deseq_with_tax_gmo[order(WC_sigtab_deseq_with_tax_gmo$log2FoldChange, decreasing=F), ]
+
+WC.sig.tax.all_gmo <- rbind(WC.sig.tax_gmo[1:1,], WC.sig.taxR_gmo[1:2,])
+
+kable(WC.sig.tax.all_gmo, caption = "Top signif diff abundant GENERA - WC ~ wild v captive")  %>% kable_styling() %>%
+  pack_rows("More abundant in 2014", 1, 1)  %>%
+  pack_rows("More abundant in 2015", 2,3 ) 
+
+```
+
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
+## Univariate analyses (taxa)
+### Phyla
+#### Data wrangling 
+```{r, warning=FALSE, message=FALSE}
+### DATA WRANGLING
+# using phyloseq to make a count table that has summed all OTUs that were in the same phylum
+ phyla_counts_tab <- otu_table(tax_glom(ASVs.B1.noRep, taxrank="Phylum"))
+
+# making a vector of phyla names to set as row names
+phyla_tax_vec <- data.frame(tax_table(tax_glom(ASVs.B1.noRep, taxrank="Phylum"))[,1:2])$Phylum
+rownames(phyla_counts_tab) <- as.vector(phyla_tax_vec)
+
+unannotated_tax_counts <- colSums(otu_table(ASVs.B1.noRep)) - colSums(phyla_counts_tab)  # zero
+ 
+# and we'll add this row to our phylum count table:
+phyla_and_unidentified_counts_tab <- rbind(phyla_counts_tab, "Unannotated"=unannotated_tax_counts)
+
+# Break up Proteobacteria per Mike Lee's suggestion
+# now we'll remove the Proteobacteria, so we can next add them back in broken down by class
+temp_major_taxa_counts_tab <- phyla_and_unidentified_counts_tab[!row.names(phyla_and_unidentified_counts_tab) %in% "p__Proteobacteria", ]
+# making count table broken down by class (contains classes beyond the Proteobacteria too at this point)
+class_counts_tab <- otu_table(tax_glom(ASVs.B1.noRep, taxrank="Class"))
+# getting a table of these class names
+class_tax_tab <- data.frame(tax_table(tax_glom(ASVs.B1.noRep, taxrank="Class"))[,1:3] )
+# making a vector of just the Proteobacteria classes
+proteo_classes_vec <- as.vector(class_tax_tab$Class[class_tax_tab$Phylum == "p__Proteobacteria"])
+# changing the row names like above so that they correspond to the taxonomy, rather than an OTU identifier
+rownames(class_counts_tab) <- as.vector(class_tax_tab$Class) 
+proteo_class_counts_tab <- class_counts_tab[row.names(class_counts_tab) %in% proteo_classes_vec, ]
+# there are also likely some some sequences that were resolved to the level of Proteobacteria, but not any further, and therefore would be missing from our class table. We can find the sum of them by subtracting the proteo clas count table from just the Proteobacteria row from the original phylum-level count table #####***** negative numbers
+proteo_no_class_annotated_counts <- colSums(proteo_class_counts_tab) - phyla_and_unidentified_counts_tab[row.names(phyla_and_unidentified_counts_tab) %in% "p__Proteobacteria", ] 
+# now combining the tables:
+major_taxa_counts_tab <- rbind(temp_major_taxa_counts_tab, proteo_class_counts_tab, "Unresolved_Proteobacteria"=proteo_no_class_annotated_counts)
+
+#Phyla proportions
+phyla_proportions_tab <- apply(major_taxa_counts_tab, 2, function(x) x/sum(x)*100)
+
+#Keep those > 5% and add those <5% to "other" col
+temp_filt_major_phyla_proportions_tab <- data.frame(phyla_proportions_tab[apply(phyla_proportions_tab, 1, max) > 5, ])
+
+filtered_phyla_proportions <- colSums(phyla_proportions_tab) - colSums(temp_filt_major_phyla_proportions_tab)
+filt_major_phyla_proportions_tab <- rbind(temp_filt_major_phyla_proportions_tab, "Other"=filtered_phyla_proportions)
+
+filt_major_phyla_proportions_tab_for_plot <- filt_major_phyla_proportions_tab
+
+# and add a column of the taxa names so that it is within the table, rather than just as row names
+filt_major_phyla_proportions_tab_for_plot$Major_Taxa <- row.names(filt_major_phyla_proportions_tab_for_plot)
+
+# Transform the table into narrow, or long, format
+filt_major_phyla_proportions_tab_for_plot.g <- gather(filt_major_phyla_proportions_tab_for_plot, Sample, Proportion, -Major_Taxa) # The "-" is supposed to be there!
+
+sample_info_for_merge<-data.frame("Sample"=row.names(sample_data(ASVs.B1.noRep)), "source"=sample_data(ASVs.B1.noRep)$source, "sex"=sample_data(ASVs.B1.noRep)$sex, "weight"=sample_data(ASVs.B1.noRep)$weight, "month_collected"=sample_data(ASVs.B1.noRep)$month_collected)
+
+# and here we are merging this table with the plotting table we just made 
+filt_major_phyla_proportions_tab_for_plot.g2 <- merge(filt_major_phyla_proportions_tab_for_plot.g, sample_info_for_merge)
+
+filt_major_phyla_proportions_tab_for_plot.g2$Major_Taxa <- plyr::mapvalues(filt_major_phyla_proportions_tab_for_plot.g2$Major_Taxa, from=c("p__Actinobacteria", "p__Bacteroidetes", "p__Firmicutes" , "p__Fusobacteria", "c__Betaproteobacteria", "c__Deltaproteobacteria", "c__Epsilonproteobacteria", "c__Gammaproteobacteria", "p__Spirochaetes", "p__Tenericutes", "p__Verrucomicrobia", "Other"), to=c("Actinobacteria", "Bacteroidetes", "Firmicutes" , "Fusobacteria", "Betaproteobacteria", "Deltaproteobacteria", "Epsilonproteobacteria", "Gammaproteobacteria", "Spirochaetes", "Tenericutes", "Verrucomicrobia", "Other"))
+
+filt_major_phyla_proportions_tab_for_plot.g2$Major_Taxa<- factor(filt_major_phyla_proportions_tab_for_plot.g2$Major_Taxa, levels=c("Actinobacteria", "Bacteroidetes", "Firmicutes" , "Fusobacteria", "Betaproteobacteria", "Deltaproteobacteria", "Epsilonproteobacteria", "Gammaproteobacteria", "Spirochaetes", "Tenericutes", "Verrucomicrobia", "Other"))
+
+```
+
+&nbsp;
+
+#### Phyla plots
+```{r, warning=FALSE, message=FALSE}
+# TUTORIAL code: stacked plot all samples by phyla per Source
+restroomRm = merge_samples(ASVs.B1.noRep, "source")
+sample_data(restroomRm)$source <- levels(as.factor(sample_data(ASVs.B1.noRep)$source))
+restroomRm = transform_sample_counts(restroomRm, function(x) 100 * x/sum(x))
+restroomRm@sam_data$source <- factor(restroomRm@sam_data$source, levels = c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI", "SBZ", "OCZ"))
+
+# Stacked plot all samples by phyla #cleaned sample names (OCZOO.1=OCZ.1a, OCZ.2=OCZ.1b, SBZOO.1=SBZ.1, SBZ.3=SBZ.2a, SBA.4=SBZ.2b)
+filt_major_phyla_proportions_tab_for_plot.g2$Sample <- factor(filt_major_phyla_proportions_tab_for_plot.g2$Sample, levels = c("SMI.4", "SMI.5", "SMI.6", "SMI.7", "SMI.8", "SMI.9", "SMI.10", "SMI.11", "SMI.12", "SMI.13", "SMI.14", "SMI.15", "SMI.16", "SRI.17", "SRI.18", "SRI.19", "SRI.20", "SRI.21", "SRI.22", "SRI.23", "SRI.24", "SRI.25", "SRI.26", "SRI.27", "SRI.28", "SRI.29", "SCZ.1", "SCZ.2", "SCZ.3", "CAT.50", "CAT.51", "CAT.53", "CAT.54", "CAT.55", "CAT.57", "CAT.58", "CAT.59", "CAT.60", "CAT.63", "CAT.16C09",  "CAT.20377", "CAT.8383D",  "CAT.E2211",  "CAT.F0534", "SCL.1",  "SCL.2", "SCL.3", "SCL.4", "SCL.5", "SCL.7",  "SCL.8",  "SCL.9", "SCL.10", "SCL.11", "SCL.13", "SCL.14", "SCL.15", "SCL.17", "SCL.19",  "SCL.20.2", "SNI.2B", "SNI.4B", "SNI.6A.mix", "SNI.7A", "SNI.9A", "SNI.10A",  "SNI.11", "SNI.12A", "SNI.13A", "SNI.14A", "SNI.15", "SNI.17", "SNI.19", "SNI.20", "SBZ.1", "SBZ.2a", "SBZ.2b", "OCZ.1a", "OCZ.1b"))
+
+filt_major_phyla_proportions_tab_for_plot.g2$source <- factor(filt_major_phyla_proportions_tab_for_plot.g2$source, levels = c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI", "SBZ", "OCZ"))
+
+filt_major_phyla_proportions_tab_for_plot.g2$color <- "foo"
+filt_major_phyla_proportions_tab_for_plot.g2$color <- ifelse(filt_major_phyla_proportions_tab_for_plot.g2$source=="SMI", "midnightblue", filt_major_phyla_proportions_tab_for_plot.g2$color)
+filt_major_phyla_proportions_tab_for_plot.g2$color <- ifelse(filt_major_phyla_proportions_tab_for_plot.g2$source=="SRI", "royalblue2", filt_major_phyla_proportions_tab_for_plot.g2$color)
+filt_major_phyla_proportions_tab_for_plot.g2$color <- ifelse(filt_major_phyla_proportions_tab_for_plot.g2$source=="SCZ", "cadetblue2", filt_major_phyla_proportions_tab_for_plot.g2$color)
+filt_major_phyla_proportions_tab_for_plot.g2$color <- ifelse(filt_major_phyla_proportions_tab_for_plot.g2$source=="CAT", "darkred", filt_major_phyla_proportions_tab_for_plot.g2$color)
+filt_major_phyla_proportions_tab_for_plot.g2$color <- ifelse(filt_major_phyla_proportions_tab_for_plot.g2$source=="SCL", "firebrick1", filt_major_phyla_proportions_tab_for_plot.g2$color)
+filt_major_phyla_proportions_tab_for_plot.g2$color <- ifelse(filt_major_phyla_proportions_tab_for_plot.g2$source=="SNI", "coral2", filt_major_phyla_proportions_tab_for_plot.g2$color)
+filt_major_phyla_proportions_tab_for_plot.g2$color <- ifelse(filt_major_phyla_proportions_tab_for_plot.g2$source=="SBZ", "darkgreen", filt_major_phyla_proportions_tab_for_plot.g2$color)
+filt_major_phyla_proportions_tab_for_plot.g2$color <- ifelse(filt_major_phyla_proportions_tab_for_plot.g2$source=="OCZ", "green2", filt_major_phyla_proportions_tab_for_plot.g2$color)
+
+step1.col <-filt_major_phyla_proportions_tab_for_plot.g2 %>% filter(Major_Taxa=="Actinobacteria")
+step2.col <-step1.col[order(factor(step1.col$Sample)),]
+col.source <- step2.col$color
+
+
+phyla.stack.p <- ggplot(filt_major_phyla_proportions_tab_for_plot.g2, aes(x=Sample, y=Proportion, fill=Major_Taxa)) +
+  geom_bar(width=0.6, stat="identity") +
+  scale_fill_brewer(palette = "Paired") +
+ # scale_fill_viridis(discrete=TRUE) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.4, hjust=1, size=8, colour = col.source), legend.title=element_blank()) +
+  labs(x="Sample", y="% of 16S rRNA gene copies recovered", title="")
+
+
+# Boxplot all by phyla, free y
+phyla.box.p2 <- ggplot(filt_major_phyla_proportions_tab_for_plot.g2, aes(source, Proportion)) +
+  geom_jitter(aes(color=factor(source)), size=2, width=0.15, height=0, show.legend = FALSE) +
+  geom_boxplot(aes(color=factor(source), alpha = 0.5), show.legend = FALSE) + 
+   scale_color_manual(values = cols) +
+  #scale_color_viridis(discrete = T, end = 0.9, direction = -1) +
+  labs(x="Source", y="% of 16S rRNA gene copies recovered", title="All samples, Major taxa") +
+  theme_bw() + theme(text = element_text(size=15), axis.text.x=element_text(size=10, angle = 45, hjust = 1.0)) + facet_wrap(~Major_Taxa, scales="free") 
+#+ stat_compare_means(aes(group=source))
+
+jpeg(filename="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/ms_drafts/FrontiersInMicro_6-26-2021/Fig2_taxaStack.jpg", units="in", width=11, height=8, res=300)
+phyla.stack.p
+dev.off()
+
+phyla.stack.p
+phyla.box.p2
+
+```
+
+&nbsp;
+
+#### Phyla summaries
+```{r, warning=FALSE, message=FALSE}
+# summaries by source and phyla
+phyla.pro.Isl.tab <- filt_major_phyla_proportions_tab_for_plot.g2 %>%
+  group_by(source, Major_Taxa) %>%
+  dplyr::summarise(meanProportion = mean(Proportion), sdProportion=sd(Proportion))
+
+
+# summaries by phyla
+phyla.pro.tab <- filt_major_phyla_proportions_tab_for_plot.g2 %>%
+ group_by(Major_Taxa) %>%
+ summarise(mean=mean(Proportion), sd=sd(Proportion)) %>%
+arrange(desc(mean))
+
+# kable(phyla.pro.tab, caption = "Top phyla ordered by mean proportion") %>% kable_styling(fixed_thead = T)
+
+```
+
+&nbsp;
+
+#### Stats on phyla
+Test for statistically significant differences of major phyla between groups (source)
+
+&nbsp;
+
+ANOVAs for phyla ~ source, since have batch need to do ANOVA + Tukey, if just source use kruskal.test + dunn test
+```{r, warning=FALSE, message=FALSE}
+# Define function to test ANOVA
+aov.phyla <- function(phylum, nam) {
+  phyla <- subset(filt_major_phyla_proportions_tab_for_plot.g2, filt_major_phyla_proportions_tab_for_plot.g2$Major_Taxa == phylum)
+  fit <- aov(Proportion ~ source, data=phyla) 
+  sum.fit<-summary(fit)
+  fit.df <- as.data.frame(cbind(signif(sum.fit[[1]][["Pr(>F)"]][[1]], digits = 3)))
+  colnames(fit.df) <- c('P')
+  rownames(fit.df) <- nam
+  post.hoc <- TukeyHSD(x=fit, "source", conf.level=0.95)
+  #fit2 <- aov(Proportion ~ source * as.factor(weight), data=phyla) 
+  #sum.fit2<-summary(fit2)
+  #post.hoc2 <- TukeyHSD(x=fit2, "weight", conf.level=0.95)
+  return(fit.df)
+}
+
+
+aov.B <- aov.phyla(phylum = "Bacteroidetes", "Bacteroidetes")
+aov.F <- aov.phyla(phylum = "Firmicutes", "Firmicutes")
+aov.Fu <- aov.phyla(phylum = "Fusobacteria", "Fusobacteria")
+aov.G <- aov.phyla(phylum = "Gammaproteobacteria", "Gammaproteobacteria")
+aov.T <- aov.phyla(phylum = "Tenericutes", "Tenericutes")
+aov.S <- aov.phyla(phylum = "Spirochaetes", "Spirochaetes")
+aov.A <- aov.phyla(phylum = "Actinobacteria", "Actinobacteria")
+
+aov.source.all <- rbind(aov.B,aov.F,aov.Fu, aov.G, aov.T, aov.S, aov.A)
+
+# kable(aov.source.all, caption = "P values from ANOVAs on source for each major taxa: Proportion ~ source") %>% kable_styling(fixed_thead = T)
+```
+
+&nbsp;
+
+Tukey's for source
+```{r, warning=FALSE, message=FALSE}
+# Define function to test Tukey's
+tuk.phyla <- function(phylum) {
+  phyla <- subset(filt_major_phyla_proportions_tab_for_plot.g2, filt_major_phyla_proportions_tab_for_plot.g2$Major_Taxa == phylum)
+  fit <- aov(Proportion ~ source, data=phyla) 
+  sum.fit<-summary(fit)
+  post.hoca <- TukeyHSD(x=fit, "source", conf.level=0.95)
+  post.hoc <- as.data.frame(post.hoca$source)
+  return(post.hoc)
+}
+
+tuk.B <- tuk.phyla(phylum = "Bacteroidetes")
+tuk.F <- tuk.phyla(phylum = "Firmicutes")
+tuk.Fu <- tuk.phyla(phylum = "Fusobacteria")
+tuk.G <- tuk.phyla(phylum = "Gammaproteobacteria")
+tuk.T <- tuk.phyla(phylum = "Tenericutes")
+tuk.S <- tuk.phyla(phylum = "Spirochaetes")
+tuk.A <- tuk.phyla(phylum = "Actinobacteria")
+
+tuk.all <- as.data.frame(cbind(round(tuk.B$`p adj`, digits=3), round(tuk.F$`p adj`, digits = 3), round(tuk.Fu$`p adj`, digits = 3), round(tuk.G$`p adj`, digits = 3), round(tuk.T$`p adj`, digits = 3), round(tuk.S$`p adj`, digits = 3), round(tuk.S$`p adj`, digits = 3)))
+rownames(tuk.all) <- rownames(tuk.B)
+colnames(tuk.all) <- c("Bacteroidetes","Firmicutes", "Fusobacteria", "Gammaproteobacteria", "Tenericutes",  "Spirochaetes", "Actinobacteria")
+
+# kable(tuk.all, caption = "Adjusted P values from Tukey HSD post hoc test on source for each major taxa") %>% kable_styling(fixed_thead = T) %>%
+#    column_spec(2, bold=tuk.all$Bacteroidetes < 0.05) %>%
+#    column_spec(3, bold=tuk.all$Firmicutes < 0.05) %>%
+#    column_spec(4, bold=tuk.all$Fusobacteria < 0.05) %>%
+#    column_spec(5, bold=tuk.all$Gammaproteobacteria < 0.05) %>%
+#    column_spec(6, bold=tuk.all$Tenericutes < 0.05) %>%
+#    column_spec(7, bold=tuk.all$Spirochaetes < 0.05) %>%
+#    column_spec(8, bold=tuk.all$Actinobacteria < 0.05) 
+
+```
+
+&nbsp;
+
+Print table of mean proportion, ANOVA results, and Tukey HSD results
+```{r, warning=FALSE, message=FALSE}
+keepers <- c("Bacteroidetes", "Firmicutes", "Fusobacteria", "Gammaproteobacteria", "Tenericutes", "Spirochaetes", "Actinobacteria")
+phyla.pro.tab.xx <- phyla.pro.tab %>% filter(Major_Taxa %in% keepers)
+phyla.pro.tab.xx$mean.sd <- gsub(" ", "", paste(signif(phyla.pro.tab.xx$mean, digits = 3), "(", signif(phyla.pro.tab.xx$sd, digits = 3), ")"))
+phyla.pro.tab.xx <- as.data.frame(phyla.pro.tab.xx)
+phyla.pro.tab.x2 <- phyla.pro.tab.xx %>% select(mean.sd)
+rownames(phyla.pro.tab.x2) <- phyla.pro.tab.xx$Major_Taxa
+
+aov.source.all$P <- as.character(aov.source.all$P)
+i <- sapply(tuk.all, is.numeric)
+tuk.all[i] <- lapply(tuk.all[i], as.character)
+
+
+tuk.all2 <- rbind( t(phyla.pro.tab.x2), t(aov.source.all), tuk.all)
+
+kable(tuk.all2, caption = "Adjusted P values from Tukey HSD post hoc test on source for each major taxa") %>% kable_styling(fixed_thead = T) 
+
+```
+
+
+&nbsp;
+&nbsp;
+
+### Class & Order
+#### Data wrangling 
+```{r, warning=FALSE, message=FALSE}
+# making count table broken down by class (contains classes beyond the Proteobacteria too at this point)
+class_counts_tab <- otu_table(tax_glom(ASVs.B1.noRep, taxrank="Class"))
+order_counts_tab <- otu_table(tax_glom(ASVs.B1.noRep, taxrank="Order"))
+
+# getting a table of these class names
+class_tax_tab <- data.frame(tax_table(tax_glom(ASVs.B1.noRep, taxrank="Class"))[,1:3] )
+rownames(class_counts_tab) <- as.vector(class_tax_tab$Class)
+order_tax_tab <- data.frame(tax_table(tax_glom(ASVs.B1.noRep, taxrank="Order"))[,1:4] )
+rownames(order_counts_tab) <- as.vector(order_tax_tab$Order)
+
+class_unannotated_tax_counts <- colSums(otu_table(ASVs.B1.noRep)) - colSums(class_counts_tab)  # zero
+order_unannotated_tax_counts <- colSums(otu_table(ASVs.B1.noRep)) - colSums(order_counts_tab)  # zero
+
+# and we'll add this row to our phylum count table:
+class_and_unidentified_counts_tab <- rbind(class_counts_tab, "Unannotated"=class_unannotated_tax_counts)
+order_and_unidentified_counts_tab <- rbind(order_counts_tab, "Unannotated"=order_unannotated_tax_counts)
+
+#class proportions
+class_proportions_tab <- apply(class_and_unidentified_counts_tab, 2, function(x) x/sum(x)*100)
+order_proportions_tab <- apply(order_and_unidentified_counts_tab, 2, function(x) x/sum(x)*100)
+
+#Keep those > 5% and add those <5% to "other" col
+temp_filt_major_class_proportions_tab <- data.frame(class_proportions_tab[apply(class_proportions_tab, 1, max) > 5, ])
+temp_filt_major_order_proportions_tab <- data.frame(order_proportions_tab[apply(order_proportions_tab, 1, max) > 5, ])
+
+filtered_class_proportions <- colSums(class_proportions_tab) - colSums(temp_filt_major_class_proportions_tab)
+filt_major_class_proportions_tab <- rbind(temp_filt_major_class_proportions_tab, "Other"=filtered_class_proportions)
+filt_major_class_proportions_tab_for_plot <- filt_major_class_proportions_tab
+
+filtered_order_proportions <- colSums(order_proportions_tab) - colSums(temp_filt_major_order_proportions_tab)
+filt_major_order_proportions_tab <- rbind(temp_filt_major_order_proportions_tab, "Other"=filtered_order_proportions)
+filt_major_order_proportions_tab_for_plot <- filt_major_order_proportions_tab
+
+# and add a column of the taxa names so that it is within the table, rather than just as row names
+filt_major_class_proportions_tab_for_plot$Major_Taxa <- row.names(filt_major_class_proportions_tab_for_plot)
+filt_major_order_proportions_tab_for_plot$Major_Taxa <- row.names(filt_major_order_proportions_tab_for_plot)
+
+# Transform the table into narrow, or long, format
+filt_major_class_proportions_tab_for_plot.g <- gather(filt_major_class_proportions_tab_for_plot, Sample, Proportion, -Major_Taxa)
+filt_major_order_proportions_tab_for_plot.g <- gather(filt_major_order_proportions_tab_for_plot, Sample, Proportion, -Major_Taxa) 
+
+sample_info_for_merge<-data.frame("Sample"=row.names(sample_data(ASVs.B1.noRep)), "source"=sample_data(ASVs.B1.noRep)$source, "sex"=sample_data(ASVs.B1.noRep)$sex, "weight"=sample_data(ASVs.B1.noRep)$weight, "month_collected"=sample_data(ASVs.B1.noRep)$month_collected)
+
+# and here we are merging this table with the plotting table we just made (this is an awesome function!)
+filt_major_class_proportions_tab_for_plot.g2 <- merge(filt_major_class_proportions_tab_for_plot.g, sample_info_for_merge)
+filt_major_order_proportions_tab_for_plot.g2 <- merge(filt_major_order_proportions_tab_for_plot.g, sample_info_for_merge)
+
+```
+
+&nbsp;
+
+#### Class and Order summaries
+```{r,  warning=FALSE, message=FALSE}
+# Summary
+class.pro.tab <- filt_major_class_proportions_tab_for_plot.g2 %>%
+ group_by(Major_Taxa) %>%
+ summarise(mean=mean(Proportion), sd=sd(Proportion)) %>%
+  arrange(desc(mean))
+  
+order.pro.tab <- filt_major_order_proportions_tab_for_plot.g2 %>%
+ group_by(Major_Taxa) %>%
+ summarise(mean=mean(Proportion), sd=sd(Proportion)) %>%
+  arrange(desc(mean))
+
+
+kable(class.pro.tab, caption = "Top classes ordered by mean proportion") %>% kable_styling(fixed_thead = T)
+kable(order.pro.tab, caption = "Top Orders ordered by mean proportion") %>% kable_styling(fixed_thead = T)
+
+```
+
+&nbsp;
+&nbsp;
+
+#### Top 10 genera summary
+```{r, warning=FALSE, message=FALSE}
+dat.aglo <- tax_glom(ASVs.B1.noRep, taxrank = "Genus")
+top20 = names(sort(taxa_sums(ASVs.B1.noRep), TRUE)[1:20])
+dat.dataframe = psmelt(dat.aglo)
+dat.dataframe.t20 <- dat.dataframe %>% filter(OTU %in% top20) %>% filter(Genus != "g__")
+dat.dataframe.t20$Genus <- str_remove(dat.dataframe.t20$Genus, "g__")
+
+# Stacked plot all samples by genus #cleaned sample names (OCZOO.1=OCZ.1a, OCZ.2=OCZ.1b, SBZOO.1=SBZ.1, SBZ.3=SBZ.2a, SBA.4=SBZ.2b)
+dat.dataframe.t20$Sample <- factor(dat.dataframe.t20$Sample, levels = c("SMI.4", "SMI.5", "SMI.6", "SMI.7", "SMI.8", "SMI.9", "SMI.10", "SMI.11", "SMI.12", "SMI.13", "SMI.14", "SMI.15", "SMI.16", "SRI.17", "SRI.18", "SRI.19", "SRI.20", "SRI.21", "SRI.22", "SRI.23", "SRI.24", "SRI.25", "SRI.26", "SRI.27", "SRI.28", "SRI.29", "SCZ.1", "SCZ.2", "SCZ.3", "CAT.50", "CAT.51", "CAT.53", "CAT.54", "CAT.55", "CAT.57", "CAT.58", "CAT.59", "CAT.60", "CAT.63", "CAT.16C09",  "CAT.20377", "CAT.8383D",  "CAT.E2211",  "CAT.F0534", "SCL.1",  "SCL.2", "SCL.3", "SCL.4", "SCL.5", "SCL.7",  "SCL.8",  "SCL.9", "SCL.10", "SCL.11", "SCL.13", "SCL.14", "SCL.15", "SCL.17", "SCL.19",  "SCL.20.2", "SNI.2B", "SNI.4B", "SNI.6A.mix", "SNI.7A", "SNI.9A", "SNI.10A",  "SNI.11", "SNI.12A", "SNI.13A", "SNI.14A", "SNI.15", "SNI.17", "SNI.19", "SNI.20", "SBZ.1", "SBZ.2a", "SBZ.2b", "OCZ.1a", "OCZ.1b"))
+
+dat.dataframe.t20$source <- factor(dat.dataframe.t20$source, levels = c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI", "SBZ", "OCZ"))
+
+dat.dataframe.t20$color <- "foo"
+dat.dataframe.t20$color <- ifelse(dat.dataframe.t20$source=="SMI", "midnightblue", dat.dataframe.t20$color)
+dat.dataframe.t20$color <- ifelse(dat.dataframe.t20$source=="SRI", "royalblue2", dat.dataframe.t20$color)
+dat.dataframe.t20$color <- ifelse(dat.dataframe.t20$source=="SCZ", "cadetblue2", dat.dataframe.t20$color)
+dat.dataframe.t20$color <- ifelse(dat.dataframe.t20$source=="CAT", "darkred", dat.dataframe.t20$color)
+dat.dataframe.t20$color <- ifelse(dat.dataframe.t20$source=="SCL", "firebrick1", dat.dataframe.t20$color)
+dat.dataframe.t20$color <- ifelse(dat.dataframe.t20$source=="SNI", "coral2", dat.dataframe.t20$color)
+dat.dataframe.t20$color <- ifelse(dat.dataframe.t20$source=="SBZ", "darkgreen", dat.dataframe.t20$color)
+dat.dataframe.t20$color <- ifelse(dat.dataframe.t20$source=="OCZ", "green2", dat.dataframe.t20$color)
+
+step1.col_g <-dat.dataframe.t20 %>% distinct(Sample, .keep_all=TRUE)
+step2.col_g <-step1.col_g[order(factor(step1.col_g$Sample)),]
+col.source_g <- step2.col_g$color
+
+genus.stack.p <- ggplot(dat.dataframe.t20, aes(x=Sample, y=Abundance, fill=Genus)) +
+  geom_bar(stat="identity", position="fill", width=0.6) +
+  scale_fill_brewer(palette = "Paired") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.4, hjust=1, size=8, colour = col.source_g), legend.title=element_blank()) +
+  labs(x="Sample", y="% of 16S rRNA gene copies recovered", title="") 
+
+
+# jpeg(filename="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/ms_drafts/FrontiersInMicro_6-26-2021/Fig2B_genusStack.jpg", units="in", width=11, height=8, res=300)
+# genus.stack.p
+# dev.off()
+
+taxa.stacks <- cowplot::plot_grid(phyla.stack.p + theme(axis.title = element_blank(), axis.text.y = element_blank()), genus.stack.p +  theme(axis.title.y = element_blank(),axis.text.y = element_blank()), ncol=1, labels = "AUTO", label_size = 16)
+
+# jpeg(filename="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/ms_drafts/FrontiersInMicro_6-26-2021/Fig2_phylaYgenus.jpg", units="in", width=11, height=8, res=300)
+# taxa.stacks
+# dev.off()
+
+
+### summary
+genus_counts_tab <- otu_table(tax_glom(ASVs.B1.noRep, taxrank="Genus"))
+genus_tax_tab <- data.frame(tax_table(tax_glom(ASVs.B1.noRep, taxrank="Genus"))[,1:6] )
+rownames(genus_counts_tab) <- as.vector(genus_tax_tab$Genus)
+genus_unannotated_tax_counts <- colSums(otu_table(ASVs.B1.noRep)) - colSums(genus_counts_tab)  # zero
+genus_and_unidentified_counts_tab <- rbind(genus_counts_tab, "Unannotated"=genus_unannotated_tax_counts)
+genus_proportions_tab <- apply(genus_and_unidentified_counts_tab, 2, function(x) x/sum(x)*100)
+
+temp_filt_major_genus_proportions_tab <- data.frame(genus_proportions_tab[apply(genus_proportions_tab, 1, max) > 5, ])
+
+filtered_genus_proportions <- colSums(genus_proportions_tab) - colSums(temp_filt_major_genus_proportions_tab)
+filt_major_genus_proportions_tab <- rbind(temp_filt_major_genus_proportions_tab, "Other"=filtered_genus_proportions)
+filt_major_genus_proportions_tab_for_plot <- filt_major_genus_proportions_tab
+filt_major_genus_proportions_tab_for_plot$Major_Taxa <- row.names(filt_major_genus_proportions_tab_for_plot)
+filt_major_genus_proportions_tab_for_plot.g <- gather(filt_major_genus_proportions_tab_for_plot, Sample, Proportion, -Major_Taxa) 
+filt_major_genus_proportions_tab_for_plot.g2 <- merge(filt_major_genus_proportions_tab_for_plot.g, sample_info_for_merge)
+
+
+genus.pro.tab <- filt_major_genus_proportions_tab_for_plot.g2 %>%
+ group_by(Major_Taxa) %>%
+ summarise(mean=mean(Proportion), sd=sd(Proportion)) %>%
+arrange(desc(mean))
+
+```
+
+
+&nbsp;
+&nbsp;
+
+### Alpha diversity metrics (Chao1 and Shannon's)
+Based on the best models, plot alpha diversity for the significant variables.
+
+&nbsp;
+
+#### Alpha diversity comparisons across all samples for source, month collected, and weight 
+```{r, warning=FALSE, message=FALSE}
+# overall
+sample_data(ASVs.B1.noRep)$source <-factor(sample_data(ASVs.B1.noRep)$source, levels=c("SMI", "SRI", "SCZ", "CAT", "SCL", "SNI", "SBZ", "OCZ"))
+sample_data(ASVs.B1.noRep)$month_collected <-factor(sample_data(ASVs.B1.noRep)$month_collected, levels=c("Jan", "Apr", "Aug", "Sep", "Oct", "Nov", "Dec"))
+sample_data(ASVs.B1.noRep.noNA)$month_collected <-factor(sample_data(ASVs.B1.noRep.noNA)$month_collected, levels=c("Jan", "Aug", "Sep", "Oct", "Nov", "Dec"))
+ASVs.B1.noRep4mo <- subset_samples(ASVs.B1.noRep,id_merge != "SNI.20" )
+
+# All samples
+a.source<-plot_richness(ASVs.B1.noRep, x="source", color="source", measures=c("Chao1", "Shannon")) +
+  scale_color_manual(values=cols) +
+  #scale_color_viridis(discrete = T, end = 0.9, direction=-1) +
+  geom_point(size=5, alpha=0.9)+ ylab("")+
+  geom_boxplot(alpha=0.5)+
+  theme_bw() + theme(text = element_text(size=15), axis.text.x = element_text(size=10), legend.position="none")
+
+a.month<-plot_richness(ASVs.B1.noRep4mo, x="month_collected", color="month_collected", measures=c("Chao1", "Shannon")) + 
+ # scale_color_viridis(discrete = TRUE) +
+  scale_color_grey(start = 0.05, end = 0.7) +
+  geom_point(size=5, alpha=0.8)+ ylab("")+
+  geom_boxplot(alpha=0.5)+
+  theme_bw() + theme(text = element_text(size=15), axis.text.x = element_text(size=10), legend.position="none")
+
+a.weight<-plot_richness(ASVs.B1.noRep.noNA, x="weight", color="weight", measures=c("Chao1", "Shannon")) + 
+  #scale_color_viridis() +
+  scale_color_gradient(low = "black", high = "gray") +
+  geom_point(size=5, alpha=0.7)+ ylab("")+
+ #geom_smooth(method = "lm")+
+  #geom_boxplot(alpha=0.5)+
+  theme_bw() + theme(text = element_text(size=15), axis.text.x = element_text(size=10), legend.position="none")
+
+cowplot::plot_grid(a.source, a.month, a.weight, labels =c("A", "B", "C"), ncol = 1)
+```
+
+&nbsp;
+
+#### Alpha diversity comparisons per island for significant variables
+```{r,  warning=FALSE, message=FALSE}
+# SRI ~ month
+sample_data(SRI.noRep.noNA)$month_collected <-factor(sample_data(SRI.noRep.noNA)$month_collected, levels=c("Nov", "Dec"))
+
+a.SRI.month2<-plot_richness(SRI.noRep.noNA, x="month_collected", shape="month_collected", measures=c("Chao1", "Shannon")) + 
+  geom_point(size=5, alpha=0.88, color= "royalblue2", fill="royalblue2")+
+  #geom_boxplot(alpha=0.5, color= "royalblue2")+
+  scale_shape_manual(values = c(16, 79)) +
+  ylab("") + xlab("SRI_month_collected") +
+  theme_bw() + theme(text = element_text(size=15), axis.text.x = element_text(size=10), legend.position="none") 
+a.SRI.month2$layers <- a.SRI.month2$layers[-1] 
+a.SRI.month2$layers <- a.SRI.month2$layers[-1]
+a.SRI.month2 <- a.SRI.month2 + geom_boxplot(alpha=0.5, color="royalblue2", outlier.shape = NA)
+
+# CAT ~ sex
+a.sex.CAT2<-plot_richness(CAT.noRep.noNA, x="sex", shape="sex", measures=c("Chao1", "Shannon")) + 
+  geom_point(size=5, alpha=0.88, color= "darkred", fill="darkred")+
+  #geom_boxplot(alpha=0.5, color= "royalblue2")+
+  scale_shape_manual(values = c(16, 79)) +
+  ylab("") + xlab("CAT_sex") +
+  theme_bw() + theme(text = element_text(size=15), axis.text.x = element_text(size=10), legend.position="none") 
+a.sex.CAT2$layers <- a.sex.CAT2$layers[-1] 
+a.sex.CAT2$layers <- a.sex.CAT2$layers[-1]
+a.sex.CAT2 <- a.sex.CAT2 + geom_boxplot(alpha=0.5, color="darkred", outlier.shape = NA)
+
+# SCL ~ weight
+a.wt.SCL2<-plot_richness(SCL.noRep.noNA, x="weight", color="weight", measures=c("Chao1", "Shannon")) + 
+  geom_point(size=5, alpha=0.7)+
+  #geom_smooth(method = "lm") +
+  #geom_boxplot(alpha=0.5)+
+ #  scale_color_viridis()+
+  scale_color_gradient(low = "wheat", high = "firebrick1") + #v_colors[5]
+  ylab("")+xlab("SCL_weight") +
+  theme_bw() + theme(text = element_text(size=15), axis.text.x = element_text(size=10), legend.position="none") 
+
+# SCL ~ year
+a.yr.SCL2<-plot_richness(SCL.noRep.noNA, x="year_collected", shape="year_collected", measures=c("Chao1", "Shannon")) + 
+  geom_point(size=5, alpha=0.88, color= "firebrick1", fill="firebrick1")+
+  #geom_boxplot(alpha=0.5, color= "royalblue2")+
+  scale_shape_manual(values = c(16, 79)) +
+  ylab("") + xlab("SCL_year") +
+  theme_bw() + theme(text = element_text(size=15), axis.text.x = element_text(size=10), legend.position="none") 
+a.yr.SCL2$layers <- a.yr.SCL2$layers[-1] 
+a.yr.SCL2$layers <- a.yr.SCL2$layers[-1]
+a.yr.SCL2 <- a.yr.SCL2 + geom_boxplot(alpha=0.5, color="firebrick1", outlier.shape = NA)
+
+cowplot::plot_grid(a.SRI.month2, a.sex.CAT2, a.wt.SCL2, a.yr.SCL2, cols = 2, rows = 2)
+
+```
+
+&nbsp;
+
+#### Alpha diversity comparisons for wild vs captive foxes
+```{r}
+# wild v captive
+W.C.noRep@sam_data$wild_captive <- factor(W.C.noRep@sam_data$wild_captive, levels = c("wild", "captive"))
+
+a.wc2<-plot_richness(W.C.noRep, x="wild_captive", shape="wild_captive", color="wild_captive", measures=c("Chao1", "Shannon")) + 
+  geom_point(size=5, alpha=0.88)+
+  #geom_boxplot(alpha=0.5, color= "royalblue2")+
+  scale_color_manual(values = c("gray", "green4"))+
+  scale_shape_manual(values = c(16, 16)) +
+  ylab("") + xlab("") + # xlab Wild_captive
+  theme_bw() + theme(text = element_text(size=15), axis.text.x = element_text(size=15), legend.position="none") 
+a.wc2$layers <- a.wc2$layers[-1] 
+a.wc2$layers <- a.wc2$layers[-1]
+a.wc2 <- a.wc2 + geom_boxplot(alpha=0.5, outlier.shape = NA)
+
+
+second.row2 <- cowplot::plot_grid(WC.box2, a.wc2, labels = c("", "C"),  ncol = 2) 
+first.row2 <- cowplot::plot_grid(W.C.pcoa.pxx2, labels = "A", ncol = 2)
+cap.p <- cowplot::plot_grid(W.C.pcoa.pxx2, second.row2, labels = "AUTO", nrow=2)
+
+# jpeg(filename="/Users/Nicole/Documents/Fox_lab/Scat_microbiome_Seq_2015/ms_drafts/FrontiersInMicro_6-26-2021/Fig4_cap.jpg", units="in", width=11, height=8, res=300)
+# cap.p
+# dev.off()
+
+
+a.wc2
+
+```
+
+&nbsp;
+&nbsp;
+
+### Relative abundance of signif ASVs
+```{r,  warning=FALSE, message=FALSE}
+#SRI
+SRI.ra = transform_sample_counts(SRI.noRep.noNA, function(x) x / sum(x) )
+ sri.nov.ra <-mean(SRI.ra@otu_table["79b4767bedcb8bbb569be837c0e91fc9"]) 
+ sri.dec.ra <-mean(SRI.ra@otu_table["e42382ea3fa1149094d507e3167e462b"])
+ 
+#CAT
+CAT.ra = transform_sample_counts(CAT.noRep.noNA, function(x) x / sum(x) )
+ cat.F.ra <-mean(CAT.ra@otu_table["290aac7b5cfcb9e70ca98c874f099965"]) 
+ cat.M.ra <-mean(CAT.ra@otu_table["b15f5845058247119ae560a6b19e2e4d"])
+ 
+#SCL
+SCL.ra = transform_sample_counts(SCL.noRep.noNA, function(x) x / sum(x) )
+ scl.14.ra <-mean(SCL.ra@otu_table["13173fa1a3d63abc7f566a5a4cbf27bc"]) 
+ scl.15.ra <-mean(SCL.ra@otu_table["3c994ad0917947698cf5235a951c4df0"])
+ scl.l.ra <-mean(SCL.ra@otu_table["06c214f56026f8ffd260f153bd0cf856"]) 
+ scl.h.ra <-mean(SCL.ra@otu_table["f62358a1dcad7653dddf044a1b7277c3"])
+ 
+#Captivity
+CAP.ra = transform_sample_counts(CAT.noRep.noNA, function(x) x / sum(x) )
+ cap.W.ra <-mean(CAP.ra@otu_table["845be19afef094e4686bb348b963a973"]) 
+ cap.C.ra <-mean(CAP.ra@otu_table["386622a3b30e3e131e44a1db5038508d"])
+ cap.14.ra <-mean(CAP.ra@otu_table["0dc4d1fbaf412171d94cf201be277c26"])
+ cap.15.ra <-mean(CAP.ra@otu_table["3c994ad0917947698cf5235a951c4df0"])
+ cap.E.ra <-mean(CAP.ra@otu_table["e60001b105ddb391087c1f6d34af54c9"])
+ cap.L.ra <-mean(CAP.ra@otu_table["efcd0461ac1ed0fea763be1234b924d9"])
+
+sigDifAsv <- c("79b4767bedcb8bbb569be837c0e91fc9","e42382ea3fa1149094d507e3167e462b", "290aac7b5cfcb9e70ca98c874f099965", "b15f5845058247119ae560a6b19e2e4d", "13173fa1a3d63abc7f566a5a4cbf27bc", "3c994ad0917947698cf5235a951c4df0", "06c214f56026f8ffd260f153bd0cf856", "f62358a1dcad7653dddf044a1b7277c3", "845be19afef094e4686bb348b963a973", "386622a3b30e3e131e44a1db5038508d", "0dc4d1fbaf412171d94cf201be277c26", "3c994ad0917947698cf5235a951c4df0", "e60001b105ddb391087c1f6d34af54c9", "efcd0461ac1ed0fea763be1234b924d9")
+sigDifAsv.ra <- c(sri.dec.ra, sri.nov.ra, cat.F.ra, cat.M.ra, scl.14.ra, scl.15.ra, scl.l.ra, scl.h.ra, cap.W.ra, cap.C.ra, cap.14.ra, cap.15.ra, cap.E.ra, cap.L.ra)
+asv.ra <- as.data.frame(cbind(sigDifAsv, round(sigDifAsv.ra, digits = 4)))
+
+  
+
+kable(asv.ra, caption = "Mean relative abundances of signif diff ASVs") %>% kable_styling() %>%
+  pack_rows("SRI", 1, 2) %>%
+  pack_rows("CAT", 3, 4) %>%
+  pack_rows("SCL", 5, 8) %>%
+  pack_rows("Captivity", 9, 14) 
+
+
+```
+
+&nbsp;
+&nbsp;
+&nbsp;
+&nbsp;
+
